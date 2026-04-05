@@ -83,23 +83,6 @@ SETEX	Store with TTL
 LPUSH	Insert into list
 LRANGE	Read list
 
-## 📁 Project Structure
-redis-lite/
-├── include/
-│   ├── network/
-│   ├── storage/
-│   └── utils/
-├── src/
-│   ├── network/
-│   ├── storage/
-│   ├── utils/
-│   └── main.cpp
-├── tests/
-├── build/
-├── CMakeLists.txt
-├── Dockerfile
-└── README.md
-
 ## 🧪 Testing
 
 Uses Google Test:
