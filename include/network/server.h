@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <stdint.h>
 #include "storage/store.h"
 
@@ -11,12 +12,17 @@ private:
     int server_fd;
     int epoll_fd;
     int leader_fd;
-    
+
     std::vector<int> replica_fds;
+
+    // Per-connection read buffers. Keyed by file descriptor.
+    // Holds partial RESP data between epoll_wait cycles.
+    std::unordered_map<int, std::string> client_buffers;
+
     int64_t last_ping_time;
     int64_t last_heartbeat;
 
-    KeyValueStore store; // Unified variable name for the database
+    KeyValueStore store;
 
     int64_t get_time_ms();
     void make_socket_non_blocking(int socket_fd);
@@ -24,11 +30,9 @@ private:
     void handle_client_data(int client_fd);
     void check_heartbeats();
     void start_heartbeat_thread();
-    std::vector<std::string> parse_resp(const std::string& input);
 
 public:
-    // Defaults leader_port to 0 if not provided
-    RedisServer(int p, int lp = 0); 
+    RedisServer(int p, int lp = 0);
     ~RedisServer();
     void run();
 };

@@ -4,13 +4,21 @@
 #include <list>
 #include <unordered_set>
 #include <variant>
+#include <vector>
+#include <utility>
+#include <cstdint>
 
-using RedisValue = std::variant<std::string, std::list<std::string>, std::unordered_set<std::string>>;
+using RedisValue = std::variant<
+    std::string,
+    std::list<std::string>,
+    std::unordered_set<std::string>,
+    std::unordered_map<std::string, std::string>   // hash type
+>;
 
 struct CacheItem {
     std::string key;
-    RedisValue value;
-    int64_t expires_at; 
+    RedisValue  value;
+    int64_t     expires_at;   // ms epoch; 0 = no expiry
 };
 
 class LRUCache {
@@ -22,11 +30,19 @@ private:
     void evict_if_needed();
 
 public:
-    LRUCache(size_t cap);
-    
-    // Put a new item in the cache
-    void put(const std::string& key, const RedisValue& value, int64_t expires_at = 0);
-    
-    // NEW: Get a pointer to the item so we can modify Lists and Sets in memory!
-    CacheItem* get_item(const std::string& key, int64_t current_time_ms);
+    explicit LRUCache(size_t cap);
+
+    void      put       (const std::string& key, const RedisValue& value, int64_t expires_at = 0);
+    CacheItem* get_item (const std::string& key, int64_t current_time_ms);
+    bool      exists    (const std::string& key, int64_t current_time_ms);
+    bool      remove    (const std::string& key);
+    bool      set_expiry(const std::string& key, int64_t expires_at);
+    size_t    size      () const;
+
+    // Full snapshot for BGREWRITEAOF — returns a copy of every live item.
+    std::vector<CacheItem> get_all_items(int64_t current_time_ms) const;
+
+    // Cursor-based SCAN. cursor=0 starts over; next_cursor=0 means done.
+    std::pair<size_t, std::vector<std::string>> scan(
+        size_t cursor, size_t count, int64_t current_time_ms) const;
 };
