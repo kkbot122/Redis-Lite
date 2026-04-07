@@ -106,9 +106,19 @@ std::string KeyValueStore::execute_command_locked(const std::vector<std::string>
 
     auto it = command_registry.find(cmd);
     if (it != command_registry.end()) {
-        return it->second(args, get_current_time_ms(), resp_version); // <--- Add resp_version here
+        return it->second(args, get_current_time_ms(), resp_version); 
     }
     return "-ERR Unknown command '" + args[0] + "'\r\n";
+}
+
+bool KeyValueStore::is_write_command(const std::string& cmd) {
+    static const std::unordered_set<std::string> writes = {
+        "SET","SETEX","GETSET","APPEND","DEL","RENAME","EXPIRE","PEXPIRE","PEXPIREAT",
+        "PERSIST","INCR","INCRBY","DECR","DECRBY","LPUSH","RPUSH","LPOP","RPOP",
+        "SADD","SREM","HSET","HDEL","HINCRBY","HINCRBYFLOAT","HSETNX","ZADD", 
+        "FLUSHDB", "BGREWRITEAOF"
+    };
+    return writes.count(cmd) > 0;
 }
 
 // ============================================================
@@ -119,13 +129,8 @@ void KeyValueStore::track_mutations(const std::vector<std::string>& args) {
     std::string cmd = args[0];
     for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
-    static const std::unordered_set<std::string> write_cmds = {
-        "SET","SETEX","GETSET","APPEND","DEL","RENAME","EXPIRE","PEXPIRE","PEXPIREAT",
-        "PERSIST","INCR","INCRBY","DECR","DECRBY","LPUSH","RPUSH","LPOP","RPOP",
-        "SADD","SREM","HSET","HDEL","HINCRBY","HINCRBYFLOAT","HSETNX","ZADD", "FLUSHDB", "BGREWRITEAOF"
-    };
-
-    if (!write_cmds.count(cmd)) return;
+    // THE FIX: Treat is_write_command as a function, not a set!
+    if (!is_write_command(cmd)) return;
 
     if (cmd == "FLUSHDB") {
         global_flush_version++; 

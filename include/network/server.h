@@ -10,6 +10,8 @@
 #include <atomic>
 #include <cstdint>
 #include "storage/store.h"
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 
 struct ClientState {
     std::string                     read_buf;
@@ -36,6 +38,13 @@ private:
     int64_t last_heartbeat;
 
     KeyValueStore store;
+
+    // TLS / SSL Networking State
+    SSL_CTX* ssl_ctx = nullptr;
+    std::unordered_map<int, SSL*> client_ssl;
+    
+    void init_ssl();
+    void secure_send(int fd, const std::string& data);
 
     // Pub/Sub
     std::unordered_map<std::string, std::set<int>> pubsub_channels;

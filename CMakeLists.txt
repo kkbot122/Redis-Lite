@@ -4,6 +4,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(include)
+find_package(OpenSSL REQUIRED)
+include_directories(${OPENSSL_INCLUDE_DIR})
+
+
 
 # ==========================================
 # 1. CORE SERVERS
@@ -18,6 +22,8 @@ add_executable(redis-server
     src/utils/logger.cpp   
     src/utils/config.cpp   
 )
+
+target_link_libraries(redis-server OpenSSL::SSL OpenSSL::Crypto)
 
 add_executable(redis-router 
     src/network/router.cpp

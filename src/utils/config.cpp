@@ -3,6 +3,8 @@
 #include <fstream>
 #include <algorithm>
 
+std::string Config::tls_cert_file = "";
+std::string Config::tls_key_file  = "";
 int         Config::port              = 6379;
 int         Config::leader_port       = 0;
 size_t      Config::max_memory        = 1000;
@@ -38,6 +40,8 @@ void Config::load(const std::string& filename) {
         else if (k == "router_port")       Config::router_port       = std::stoi(v);
         else if (k == "unixsocket")        Config::unixsocket        = v;
         else if (k == "rdb_save_seconds")  Config::rdb_save_seconds  = std::stoi(v);
+        else if (k == "tls_cert_file") Config::tls_cert_file = v;
+        else if (k == "tls_key_file")  Config::tls_key_file = v;
     }
     Logger::info("Config loaded from " + filename);
 }

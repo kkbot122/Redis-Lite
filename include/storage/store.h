@@ -70,6 +70,8 @@ public:
     KeyValueStore();
     ~KeyValueStore();
 
+    static bool is_write_command(const std::string& cmd);
+
     std::string execute_command(const std::vector<std::string>& args,
                                 TxState& tx, bool& authenticated, int resp_version=2);
     
