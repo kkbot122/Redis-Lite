@@ -16,10 +16,9 @@ struct SlowlogEntry {
     std::vector<std::string> args;
 };
 
-// Per-connection transaction state. The server allocates one per client fd.
 struct TxState {
-    bool                              active  = false;   // MULTI issued
-    bool                              errored = false;   // command error inside MULTI
+    bool                                  active  = false;
+    bool                                  errored = false;
     std::vector<std::vector<std::string>> queue;
 };
 
@@ -34,11 +33,12 @@ private:
     int64_t              start_time_ms;
     std::atomic<int64_t> total_commands{0};
     std::atomic<bool>    rewrite_in_progress{false};
+    std::atomic<bool>    rdb_save_in_progress{false};
+    std::atomic<int64_t> last_save_time{0};      // unix seconds of last successful SAVE
 
-    // Slowlog
-    mutable std::mutex   slowlog_mtx;
+    mutable std::mutex       slowlog_mtx;
     std::deque<SlowlogEntry> slowlog;
-    std::atomic<int64_t> slowlog_id{0};
+    std::atomic<int64_t>     slowlog_id{0};
 
     int64_t     get_current_time_ms() const;
     void        append_to_aof(const std::vector<std::string>& args);
@@ -48,14 +48,19 @@ private:
     std::string build_info(const std::string& section) const;
     void        record_slowlog(const std::vector<std::string>& args, int64_t duration_ms);
 
+    // RDB helpers (binary snapshot format)
+    bool        rdb_save_snapshot(const std::string& path,
+                                  const std::vector<CacheItem>& items) const;
+    bool        rdb_load_snapshot(const std::string& path);
+
 public:
     KeyValueStore();
     ~KeyValueStore();
 
-    // Main entry — thread-safe, records slowlog, handles AUTH.
-    // tx: per-connection transaction state (owned by the server, passed in).
-    // authenticated: per-connection auth flag.
     std::string execute_command(const std::vector<std::string>& args,
                                 TxState& tx,
                                 bool& authenticated);
+
+    // Called by the server's auto-save timer.
+    void maybe_auto_save();
 };

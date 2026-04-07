@@ -2,6 +2,7 @@
 #include "utils/logger.h"
 #include "utils/config.h"
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
@@ -13,24 +14,15 @@
 #include <thread>
 #include <csignal>
 #include <atomic>
-
-// ============================================================
-// Graceful shutdown via SIGTERM / SIGINT
-// ============================================================
+#include <random>
+#include <iomanip>
+#include <fstream>
 
 static std::atomic<bool> g_shutdown{false};
-
-static void signal_handler(int) {
-    g_shutdown.store(true);
-}
-
-// ============================================================
-// Write commands that must be replicated to followers
-// ============================================================
+static void signal_handler(int) { g_shutdown.store(true); }
 
 static const std::unordered_set<std::string> WRITE_COMMANDS = {
-    "SET","SETEX","GETSET","APPEND",
-    "DEL","RENAME",
+    "SET","SETEX","GETSET","APPEND","DEL","RENAME",
     "EXPIRE","PEXPIRE","PEXPIREAT","PERSIST",
     "INCR","INCRBY","DECR","DECRBY",
     "LPUSH","RPUSH","LPOP","RPOP",
@@ -40,14 +32,11 @@ static const std::unordered_set<std::string> WRITE_COMMANDS = {
 };
 
 // ============================================================
-// RESP frame parser (returns bytes consumed, 0 = incomplete)
+// RESP frame parser
 // ============================================================
 
-static size_t try_parse_one_resp(const std::string& buf,
-                                  std::vector<std::string>& args) {
+static size_t try_parse_one_resp(const std::string& buf, std::vector<std::string>& args) {
     if (buf.empty()) return 0;
-
-    // Inline fallback
     if (buf[0] != '*') {
         size_t nl = buf.find('\n');
         if (nl == std::string::npos) return 0;
@@ -57,20 +46,17 @@ static size_t try_parse_one_resp(const std::string& buf,
         while (ss >> t) args.push_back(t);
         return nl + 1;
     }
-
-    size_t pos = 0;
-    size_t rn  = buf.find("\r\n", pos);
+    size_t pos = 0, rn = buf.find("\r\n", pos);
     if (rn == std::string::npos) return 0;
     int argc = 0;
     try { argc = std::stoi(buf.substr(1, rn - 1)); } catch (...) { return 0; }
     pos = rn + 2;
-
     for (int i = 0; i < argc; ++i) {
         if (pos >= buf.size() || buf[pos] != '$') return 0;
         rn = buf.find("\r\n", pos);
         if (rn == std::string::npos) return 0;
         int len = 0;
-        try { len = std::stoi(buf.substr(pos + 1, rn - pos - 1)); } catch (...) { return 0; }
+        try { len = std::stoi(buf.substr(pos+1, rn-pos-1)); } catch (...) { return 0; }
         pos = rn + 2;
         if (pos + static_cast<size_t>(len) + 2 > buf.size()) return 0;
         args.push_back(buf.substr(pos, len));
@@ -87,11 +73,15 @@ RedisServer::RedisServer(int p, int lp)
     : port(p), leader_port(lp), leader_fd(-1) {
     last_ping_time = get_time_ms();
     last_heartbeat = get_time_ms();
+    repl_id = generate_repl_id();
+    Logger::info("Replication ID: " + repl_id);
 }
 
 RedisServer::~RedisServer() {
     if (server_fd != -1) close(server_fd);
+    if (unix_fd   != -1) close(unix_fd);
     if (epoll_fd  != -1) close(epoll_fd);
+    if (!Config::unixsocket.empty()) unlink(Config::unixsocket.c_str());
 }
 
 int64_t RedisServer::get_time_ms() {
@@ -100,24 +90,151 @@ int64_t RedisServer::get_time_ms() {
 }
 
 void RedisServer::make_socket_non_blocking(int fd) {
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags == -1) flags = 0;
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int f = fcntl(fd, F_GETFL, 0);
+    if (f == -1) f = 0;
+    fcntl(fd, F_SETFL, f | O_NONBLOCK);
 }
 
 // ============================================================
-// Signal handler setup
+// Replication ID generator
 // ============================================================
 
-void RedisServer::setup_signal_handlers() {
-    struct sigaction sa{};
-    sa.sa_handler = signal_handler;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGTERM, &sa, nullptr);
-    sigaction(SIGINT,  &sa, nullptr);
-    // Ignore SIGPIPE so a broken client connection doesn't kill the server.
-    signal(SIGPIPE, SIG_IGN);
+std::string RedisServer::generate_repl_id() const {
+    std::mt19937_64 rng(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::uniform_int_distribution<uint64_t> dist;
+    std::ostringstream oss;
+    for (int i = 0; i < 5; ++i)
+        oss << std::hex << std::setfill('0') << std::setw(8) << (dist(rng) & 0xFFFFFFFF);
+    return oss.str();
+}
+
+// ============================================================
+// Replication backlog
+// ============================================================
+
+void RedisServer::append_to_backlog(const std::string& data) {
+    std::lock_guard<std::mutex> lk(backlog_mtx);
+    for (char c : data) repl_backlog.push_back(c);
+    while (repl_backlog.size() > BACKLOG_SIZE) repl_backlog.pop_front();
+}
+
+void RedisServer::replicate(const std::vector<std::string>& args) {
+    std::string repl = "*" + std::to_string(args.size()) + "\r\n";
+    for (const auto& a : args)
+        repl += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
+
+    append_to_backlog(repl);
+    repl_offset.fetch_add(static_cast<int64_t>(repl.size()));
+
+    for (int rep_fd : replica_fds)
+        send(rep_fd, repl.c_str(), repl.size(), 0);
+}
+
+// ============================================================
+// Full resync: send RDB snapshot to a new replica
+// ============================================================
+
+void RedisServer::send_full_resync(int replica_fd) {
+    // Tell the replica to expect a full resync.
+    std::string header = "+FULLRESYNC " + repl_id + " " +
+                         std::to_string(repl_offset.load()) + "\r\n";
+    send(replica_fd, header.c_str(), header.size(), 0);
+
+    // Trigger a blocking SAVE so we have a fresh RDB on disk.
+    // In production this should fork() to avoid blocking, but for our
+    // single-process model a synchronous save is acceptable.
+    std::ifstream rdb(Config::rdb_file, std::ios::binary | std::ios::ate);
+    if (!rdb.is_open()) {
+        // No RDB yet — send an empty RDB (minimal valid header + EOF).
+        const unsigned char empty_rdb[] = {
+            0x52,0x45,0x44,0x49,0x53,  // "REDIS"
+            0x30,0x30,0x31,0x31,       // "0011"
+            0xFF,                       // EOF
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00  // 8-byte CRC (zeroed)
+        };
+        std::string preamble = "$" + std::to_string(sizeof(empty_rdb)) + "\r\n";
+        send(replica_fd, preamble.c_str(), preamble.size(), 0);
+        send(replica_fd, reinterpret_cast<const char*>(empty_rdb), sizeof(empty_rdb), 0);
+        return;
+    }
+
+    std::streamsize size = rdb.tellg();
+    rdb.seekg(0, std::ios::beg);
+
+    std::string preamble = "$" + std::to_string(size) + "\r\n";
+    send(replica_fd, preamble.c_str(), preamble.size(), 0);
+
+    char buf[8192];
+    while (rdb.read(buf, sizeof(buf)) || rdb.gcount() > 0)
+        send(replica_fd, buf, static_cast<size_t>(rdb.gcount()), 0);
+}
+
+// ============================================================
+// REPLCONF / PSYNC handshake
+// ============================================================
+
+bool RedisServer::handle_replication_handshake(int fd,
+                                                const std::vector<std::string>& args) {
+    if (args.empty()) return false;
+    std::string cmd = args[0];
+    for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+
+    // REPLCONF listening-port <port>  /  REPLCONF capa eof  /  REPLCONF ACK <offset>
+    if (cmd == "REPLCONF") {
+        if (args.size() >= 3) {
+            std::string sub = args[1];
+            for (char& c : sub) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+            if (sub == "ACK") {
+                // Replica is confirming it has processed up to this offset.
+                try {
+                    int64_t replica_offset = std::stoll(args[2]);
+                    clients[fd].repl_offset = replica_offset;
+                } catch (...) {}
+                return true;   // ACK — no response needed.
+            }
+        }
+        send(fd, "+OK\r\n", 5, 0);
+        return true;
+    }
+
+    // PSYNC <repl_id> <offset>
+    if (cmd == "PSYNC" && args.size() >= 3) {
+        const std::string& peer_id     = args[1];
+        int64_t            peer_offset = -1;
+        try { peer_offset = std::stoll(args[2]); } catch (...) {}
+
+        bool can_partial = false;
+        if (peer_id == repl_id && peer_offset >= 0) {
+            // Check whether the requested offset is still in our backlog.
+            std::lock_guard<std::mutex> lk(backlog_mtx);
+            int64_t backlog_start = repl_offset.load() -
+                                    static_cast<int64_t>(repl_backlog.size());
+            can_partial = (peer_offset >= backlog_start);
+
+            if (can_partial) {
+                // Partial resync — send only the missing bytes.
+                std::string cont = "+CONTINUE " + repl_id + "\r\n";
+                send(fd, cont.c_str(), cont.size(), 0);
+
+                size_t skip = static_cast<size_t>(peer_offset - backlog_start);
+                std::string missing(repl_backlog.begin() + skip, repl_backlog.end());
+                if (!missing.empty())
+                    send(fd, missing.c_str(), missing.size(), 0);
+
+                replica_fds.push_back(fd);
+                Logger::info("Partial resync with replica fd=" + std::to_string(fd));
+                return true;
+            }
+        }
+
+        // Full resync.
+        send_full_resync(fd);
+        replica_fds.push_back(fd);
+        Logger::info("Full resync with replica fd=" + std::to_string(fd));
+        return true;
+    }
+
+    return false;
 }
 
 // ============================================================
@@ -135,75 +252,56 @@ bool RedisServer::handle_pubsub(int fd, const std::vector<std::string>& args) {
         for (size_t i = 1; i < args.size(); ++i) {
             pubsub_channels[args[i]].insert(fd);
             state.subscriptions.insert(args[i]);
-            // RESP: *3\r\n$9\r\nsubscribe\r\n$<n>\r\n<ch>\r\n:<count>\r\n
-            std::string resp = "*3\r\n$9\r\nsubscribe\r\n";
-            resp += "$" + std::to_string(args[i].size()) + "\r\n" + args[i] + "\r\n";
-            resp += ":" + std::to_string(state.subscriptions.size()) + "\r\n";
-            send(fd, resp.c_str(), resp.size(), 0);
+            std::string r = "*3\r\n$9\r\nsubscribe\r\n$"+std::to_string(args[i].size())+"\r\n"+args[i]+"\r\n:"+std::to_string(state.subscriptions.size())+"\r\n";
+            send(fd, r.c_str(), r.size(), 0);
         }
         return true;
     }
-
     if (cmd == "UNSUBSCRIBE") {
         std::lock_guard<std::mutex> lk(pubsub_mtx);
         auto& state = clients[fd];
-        std::vector<std::string> channels =
-            args.size() >= 2
-                ? std::vector<std::string>(args.begin() + 1, args.end())
-                : std::vector<std::string>(state.subscriptions.begin(), state.subscriptions.end());
-
+        std::vector<std::string> channels = args.size() >= 2
+            ? std::vector<std::string>(args.begin()+1, args.end())
+            : std::vector<std::string>(state.subscriptions.begin(), state.subscriptions.end());
         for (const auto& ch : channels) {
             pubsub_channels[ch].erase(fd);
             if (pubsub_channels[ch].empty()) pubsub_channels.erase(ch);
             state.subscriptions.erase(ch);
-            std::string resp = "*3\r\n$11\r\nunsubscribe\r\n";
-            resp += "$" + std::to_string(ch.size()) + "\r\n" + ch + "\r\n";
-            resp += ":" + std::to_string(state.subscriptions.size()) + "\r\n";
-            send(fd, resp.c_str(), resp.size(), 0);
+            std::string r = "*3\r\n$11\r\nunsubscribe\r\n$"+std::to_string(ch.size())+"\r\n"+ch+"\r\n:"+std::to_string(state.subscriptions.size())+"\r\n";
+            send(fd, r.c_str(), r.size(), 0);
         }
         return true;
     }
-
     if (cmd == "PUBLISH" && args.size() >= 3) {
-        const std::string& channel = args[1];
-        const std::string& message = args[2];
-        int receivers = 0;
+        int recv = 0;
         {
             std::lock_guard<std::mutex> lk(pubsub_mtx);
-            auto it = pubsub_channels.find(channel);
+            auto it = pubsub_channels.find(args[1]);
             if (it != pubsub_channels.end()) {
-                std::string msg = "*3\r\n$7\r\nmessage\r\n";
-                msg += "$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n";
-                msg += "$" + std::to_string(message.size()) + "\r\n" + message + "\r\n";
-                for (int sub_fd : it->second) {
-                    send(sub_fd, msg.c_str(), msg.size(), 0);
-                    ++receivers;
-                }
+                std::string msg = "*3\r\n$7\r\nmessage\r\n$"+std::to_string(args[1].size())+"\r\n"+args[1]+"\r\n$"+std::to_string(args[2].size())+"\r\n"+args[2]+"\r\n";
+                for (int s : it->second) { send(s, msg.c_str(), msg.size(), 0); ++recv; }
             }
         }
-        // PUBLISH returns the number of subscribers that received the message.
-        std::string r = ":" + std::to_string(receivers) + "\r\n";
+        std::string r = ":"+std::to_string(recv)+"\r\n";
         send(fd, r.c_str(), r.size(), 0);
         return true;
     }
-
     return false;
 }
 
 // ============================================================
-// close_client — cleans up all per-connection state
+// close_client
 // ============================================================
 
 void RedisServer::close_client(int fd) {
     {
         std::lock_guard<std::mutex> lk(pubsub_mtx);
         auto it = clients.find(fd);
-        if (it != clients.end()) {
+        if (it != clients.end())
             for (const auto& ch : it->second.subscriptions) {
                 pubsub_channels[ch].erase(fd);
                 if (pubsub_channels[ch].empty()) pubsub_channels.erase(ch);
             }
-        }
     }
     clients.erase(fd);
     replica_fds.erase(std::remove(replica_fds.begin(), replica_fds.end(), fd), replica_fds.end());
@@ -212,15 +310,25 @@ void RedisServer::close_client(int fd) {
 }
 
 // ============================================================
+// Signal handlers
+// ============================================================
+
+void RedisServer::setup_signal_handlers() {
+    struct sigaction sa{};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT,  &sa, nullptr);
+    signal(SIGPIPE, SIG_IGN);
+}
+
+// ============================================================
 // run()
 // ============================================================
 
 void RedisServer::run() {
     setup_signal_handlers();
-
     Logger::info("Starting server on port " + std::to_string(port));
-    if (leader_port > 0)
-        Logger::info("Replica mode — following port " + std::to_string(leader_port));
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) { Logger::error("socket() failed"); return; }
@@ -232,7 +340,6 @@ void RedisServer::run() {
     addr.sin_family      = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port        = htons(port);
-
     if (bind(server_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         Logger::error("bind() failed on port " + std::to_string(port)); return;
     }
@@ -242,11 +349,35 @@ void RedisServer::run() {
     epoll_fd = epoll_create1(0);
     if (epoll_fd < 0) { Logger::error("epoll_create1() failed"); return; }
 
-    struct epoll_event ev{};
-    ev.events = EPOLLIN; ev.data.fd = server_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_fd, &ev);
+    auto epoll_add = [&](int fd) {
+        struct epoll_event ev{};
+        ev.events  = EPOLLIN | EPOLLET;
+        ev.data.fd = fd;
+        epoll_ctl(epoll_fd, EPOLL_CTL_ADD, fd, &ev);
+    };
+    epoll_add(server_fd);
 
-    // Replica startup
+    // ---- Unix domain socket ----
+    if (!Config::unixsocket.empty()) {
+        unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (unix_fd >= 0) {
+            unlink(Config::unixsocket.c_str());
+            struct sockaddr_un un_addr{};
+            un_addr.sun_family = AF_UNIX;
+            strncpy(un_addr.sun_path, Config::unixsocket.c_str(), sizeof(un_addr.sun_path)-1);
+            if (bind(unix_fd, reinterpret_cast<struct sockaddr*>(&un_addr), sizeof(un_addr)) == 0) {
+                listen(unix_fd, 128);
+                make_socket_non_blocking(unix_fd);
+                epoll_add(unix_fd);
+                Logger::info("Unix socket: " + Config::unixsocket);
+            } else {
+                Logger::error("Failed to bind unix socket: " + Config::unixsocket);
+                close(unix_fd); unix_fd = -1;
+            }
+        }
+    }
+
+    // ---- Replica startup ----
     if (leader_port > 0) {
         leader_fd = socket(AF_INET, SOCK_STREAM, 0);
         struct sockaddr_in la{};
@@ -255,11 +386,19 @@ void RedisServer::run() {
         if (connect(leader_fd, reinterpret_cast<struct sockaddr*>(&la), sizeof(la)) == 0) {
             Logger::info("Connected to leader on port " + std::to_string(leader_port));
             make_socket_non_blocking(leader_fd);
-            struct epoll_event le{}; le.events = EPOLLIN; le.data.fd = leader_fd;
-            epoll_ctl(epoll_fd, EPOLL_CTL_ADD, leader_fd, &le);
-            clients[leader_fd]; // allocate state
-            const std::string hs = "*1\r\n$9\r\nREPLICAOF\r\n";
-            send(leader_fd, hs.c_str(), hs.size(), 0);
+            epoll_add(leader_fd);
+            clients[leader_fd].authenticated = true;
+
+            // Handshake: REPLCONF listening-port, then PSYNC
+            auto send_resp = [&](const std::vector<std::string>& a) {
+                std::string s = "*"+std::to_string(a.size())+"\r\n";
+                for (const auto& x : a) s += "$"+std::to_string(x.size())+"\r\n"+x+"\r\n";
+                send(leader_fd, s.c_str(), s.size(), 0);
+            };
+            send_resp({"REPLCONF", "listening-port", std::to_string(port)});
+            send_resp({"REPLCONF", "capa", "eof"});
+            // Request partial sync from offset 0 with no known ID.
+            send_resp({"PSYNC", "?", "-1"});
         } else {
             Logger::error("Failed to connect to leader on port " + std::to_string(leader_port));
             close(leader_fd); leader_fd = -1;
@@ -267,48 +406,52 @@ void RedisServer::run() {
     }
 
     start_heartbeat_thread();
-    Logger::info("Server ready. SIGTERM/SIGINT will trigger graceful shutdown.");
+    Logger::info("Server ready. repl_id=" + repl_id);
 
     struct epoll_event events[64];
     while (!g_shutdown.load()) {
         int n = epoll_wait(epoll_fd, events, 64, 1000);
         check_heartbeats();
+        store.maybe_auto_save();
+
         for (int i = 0; i < n; ++i) {
-            if (events[i].data.fd == server_fd) handle_new_connection();
-            else                                 handle_client_data(events[i].data.fd);
+            int fd = events[i].data.fd;
+            if (fd == server_fd || fd == unix_fd) handle_new_connection(fd);
+            else                                   handle_client_data(fd);
         }
     }
 
-    // ---- Graceful shutdown ----
-    Logger::info("Shutdown signal received — flushing AOF and closing connections.");
-    // Flush the store's AOF via BGREWRITEAOF before exit is possible but
-    // a simple approach is to just let the KeyValueStore destructor close
-    // the file (it calls aof_file.close() which flushes).
-    // Close all client sockets cleanly.
+    Logger::info("Shutdown — saving RDB and closing connections.");
+    TxState tx; bool auth = true;
+    store.execute_command({"SAVE"}, tx, auth);
     std::vector<int> all_fds;
-    for (const auto& [fd, _] : clients) all_fds.push_back(fd);
+    for (const auto& [fd,_] : clients) all_fds.push_back(fd);
     for (int fd : all_fds) close_client(fd);
     close(server_fd); server_fd = -1;
-    Logger::info("Server stopped cleanly.");
+    Logger::info("Stopped cleanly.");
 }
 
 // ============================================================
 // handle_new_connection
 // ============================================================
 
-void RedisServer::handle_new_connection() {
-    int client_fd = accept(server_fd, nullptr, nullptr);
+void RedisServer::handle_new_connection(int listening_fd) {
+    int client_fd;
+    if (listening_fd == unix_fd) {
+        client_fd = accept(unix_fd, nullptr, nullptr);
+    } else {
+        client_fd = accept(server_fd, nullptr, nullptr);
+    }
     if (client_fd < 0) return;
-    make_socket_non_blocking(client_fd);
 
+    make_socket_non_blocking(client_fd);
     struct epoll_event ev{};
-    ev.events  = EPOLLIN | EPOLLET;
-    ev.data.fd = client_fd;
+    ev.events = EPOLLIN | EPOLLET; ev.data.fd = client_fd;
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
 
     ClientState& s  = clients[client_fd];
     s.read_buf      = "";
-    s.authenticated = Config::requirepass.empty(); // pre-auth if no password set
+    s.authenticated = Config::requirepass.empty();
 }
 
 // ============================================================
@@ -319,11 +462,9 @@ void RedisServer::handle_client_data(int fd) {
     char buf[4096];
     while (true) {
         ssize_t n = read(fd, buf, sizeof(buf));
-        if (n > 0) {
-            clients[fd].read_buf.append(buf, n);
-        } else if (n == 0) {
-            close_client(fd); return;
-        } else {
+        if (n > 0) { clients[fd].read_buf.append(buf, n); }
+        else if (n == 0) { close_client(fd); return; }
+        else {
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             close_client(fd); return;
         }
@@ -342,14 +483,20 @@ void RedisServer::handle_client_data(int fd) {
         std::string cmd = args[0];
         for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
-        // Replica handshake
-        if (cmd == "REPLICAOF") {
-            Logger::info("Replica registered fd=" + std::to_string(fd));
-            replica_fds.push_back(fd);
+        // REPLCONF / PSYNC from a replica connecting to us as leader
+        if ((cmd == "REPLCONF" || cmd == "PSYNC") && leader_port == 0) {
+            handle_replication_handshake(fd, args);
             continue;
         }
 
-        // Pub/sub commands are handled separately and never reach the store.
+        // FULLRESYNC / RDB preamble from leader to us as replica — handled implicitly
+        // via the binary data flow; nothing to dispatch here.
+        if (fd == leader_fd && cmd == "PING") {
+            // Leader keepalive — just update the heartbeat (already done above).
+            continue;
+        }
+
+        // Pub/Sub commands
         if (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE" || cmd == "PUBLISH") {
             handle_pubsub(fd, args);
             continue;
@@ -360,14 +507,9 @@ void RedisServer::handle_client_data(int fd) {
         if (fd != leader_fd)
             send(fd, response.c_str(), response.size(), 0);
 
-        // Replicate successful writes to followers
-        if (leader_port == 0 && WRITE_COMMANDS.count(cmd) && response[0] != '-') {
-            std::string repl = "*" + std::to_string(args.size()) + "\r\n";
-            for (const auto& a : args)
-                repl += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
-            for (int rep_fd : replica_fds)
-                send(rep_fd, repl.c_str(), repl.size(), 0);
-        }
+        // Replicate successful writes
+        if (leader_port == 0 && WRITE_COMMANDS.count(cmd) && response[0] != '-')
+            replicate(args);
     }
 }
 
@@ -377,16 +519,24 @@ void RedisServer::handle_client_data(int fd) {
 
 void RedisServer::check_heartbeats() {
     int64_t now = get_time_ms();
+
     if (leader_port == 0 && now - last_ping_time > 2000) {
+        // Send PING + ask each replica for its offset via REPLCONF GETACK
         const std::string ping = "*1\r\n$4\r\nPING\r\n";
-        for (int rep_fd : replica_fds) send(rep_fd, ping.c_str(), ping.size(), 0);
+        const std::string ack  = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
+        for (int rep_fd : replica_fds) {
+            send(rep_fd, ping.c_str(), ping.size(), 0);
+            send(rep_fd, ack.c_str(),  ack.size(),  0);
+        }
         last_ping_time = now;
     }
+
     if (leader_port > 0 && leader_fd != -1 && now - last_heartbeat > 5000) {
         Logger::error("Leader silent — promoting self to leader.");
         close_client(leader_fd);
         leader_fd = -1; leader_port = 0;
-        Logger::info("Promoted to leader on port " + std::to_string(port));
+        repl_id = generate_repl_id();   // New ID after promotion.
+        Logger::info("Promoted to leader. New repl_id=" + repl_id);
     }
 }
 
@@ -400,8 +550,7 @@ void RedisServer::start_heartbeat_thread() {
             int sock = socket(AF_INET, SOCK_STREAM, 0);
             if (sock >= 0) {
                 struct sockaddr_in ra{};
-                ra.sin_family = AF_INET;
-                ra.sin_port   = htons(Config::router_port);
+                ra.sin_family = AF_INET; ra.sin_port = htons(Config::router_port);
                 inet_pton(AF_INET, "127.0.0.1", &ra.sin_addr);
                 if (connect(sock, reinterpret_cast<struct sockaddr*>(&ra), sizeof(ra)) == 0) {
                     std::string pulse = "HEARTBEAT " + std::to_string(port) + "\r\n";
