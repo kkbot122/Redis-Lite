@@ -7,12 +7,19 @@
 #include <vector>
 #include <utility>
 #include <cstdint>
+#include <set>
+
+struct ZSet {
+    std::unordered_map<std::string, double> dict;   // O(1) score lookups
+    std::set<std::pair<double, std::string>> tree;  // O(log N) ordered iteration
+};
 
 using RedisValue = std::variant<
     std::string,
     std::list<std::string>,
     std::unordered_set<std::string>,
-    std::unordered_map<std::string, std::string>   // hash type
+    std::unordered_map<std::string, std::string>,
+    ZSet
 >;
 
 struct CacheItem {

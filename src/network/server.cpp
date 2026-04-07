@@ -28,7 +28,8 @@ static const std::unordered_set<std::string> WRITE_COMMANDS = {
     "LPUSH","RPUSH","LPOP","RPOP",
     "SADD","SREM",
     "HSET","HDEL","HINCRBY","HINCRBYFLOAT","HSETNX",
-    "FLUSHDB","BGREWRITEAOF"
+    "FLUSHDB","BGREWRITEAOF",
+    "ZADD"
 };
 
 // ============================================================

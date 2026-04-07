@@ -31,6 +31,7 @@ static constexpr uint8_t  RDB_TYPE_STRING = 0;
 static constexpr uint8_t  RDB_TYPE_LIST   = 1;
 static constexpr uint8_t  RDB_TYPE_SET    = 2;
 static constexpr uint8_t  RDB_TYPE_HASH   = 3;
+static constexpr uint8_t  RDB_TYPE_ZSET   = 4;
 static constexpr uint8_t  RDB_EOF         = 0xFF;
 static const     char     RDB_MAGIC[]     = "REDISLITE";
 static constexpr uint32_t RDB_VERSION     = 1;
@@ -54,6 +55,9 @@ static bool rstr(std::ifstream& f, std::string& s) {
     s.resize(len);
     return static_cast<bool>(f.read(&s[0], len));
 }
+
+static void wdouble(std::ofstream& f, double v) { f.write(reinterpret_cast<const char*>(&v), 8); }
+static bool rdouble(std::ifstream& f, double& v) { return static_cast<bool>(f.read(reinterpret_cast<char*>(&v), 8)); }
 
 // ============================================================
 // Constructor / Destructor
@@ -161,6 +165,16 @@ bool KeyValueStore::rdb_save_snapshot(const std::string& path,
             wstr(f, item.key);
             w32(f, static_cast<uint32_t>(h.size()));
             for (const auto& [fld, val] : h) { wstr(f, fld); wstr(f, val); }
+        } else if (std::holds_alternative<ZSet>(item.value)) {
+            const auto& z = std::get<ZSet>(item.value);
+            w8(f, RDB_TYPE_ZSET);
+            w64(f, item.expires_at);
+            wstr(f, item.key);
+            w32(f, static_cast<uint32_t>(z.dict.size()));
+            for (const auto& [member, score] : z.dict) { 
+                wstr(f, member); 
+                wdouble(f, score); 
+            }
         }
     }
 
@@ -241,6 +255,18 @@ bool KeyValueStore::rdb_load_snapshot(const std::string& path) {
                 h[std::move(fld)] = std::move(val);
             }
             if (!expired) { cache.put(key, h, expires_at); ++loaded; }
+        } else if (type == RDB_TYPE_ZSET) {
+            uint32_t count = 0;
+            if (!r32(f, count)) break;
+            ZSet z;
+            for (uint32_t i = 0; i < count; ++i) {
+                std::string m; 
+                double score = 0;
+                if (!rstr(f, m) || !rdouble(f, score)) goto done;
+                z.dict[m] = score;
+                z.tree.insert({score, m});
+            }
+            if (!expired) { cache.put(key, z, expires_at); ++loaded; }
         }
     }
 
@@ -306,6 +332,17 @@ std::string KeyValueStore::serialize_item_to_resp(const CacheItem& item) const {
         if (!h->empty()) {
             std::vector<std::string> a = {"HSET", item.key};
             for (const auto& [f,v] : *h) { a.push_back(f); a.push_back(v); }
+            out += rc(a);
+        }
+    } else if (const auto* zs = std::get_if<ZSet>(&item.value)) {
+        if (!zs->dict.empty()) {
+            std::vector<std::string> a = {"ZADD", item.key};
+            for (const auto& [score, member] : zs->tree) {
+                std::ostringstream oss;
+                oss << score; 
+                a.push_back(oss.str());
+                a.push_back(member);
+            }
             out += rc(a);
         }
     }
@@ -541,6 +578,7 @@ std::string KeyValueStore::execute_command_locked(const std::vector<std::string>
         if (std::holds_alternative<std::list<std::string>>(item->value))                       return "+list\r\n";
         if (std::holds_alternative<std::unordered_set<std::string>>(item->value))              return "+set\r\n";
         if (std::holds_alternative<std::unordered_map<std::string,std::string>>(item->value))  return "+hash\r\n";
+        if (std::holds_alternative<ZSet>(item->value)) return "+zset\r\n";
     }
     if (cmd == "RENAME" && args.size() >= 3) {
         CacheItem* item=cache.get_item(args[1],now);
@@ -634,6 +672,94 @@ std::string KeyValueStore::execute_command_locked(const std::vector<std::string>
     if(cmd=="HVALS"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){std::string r="*"+std::to_string(h->size())+"\r\n";for(const auto&[k,v]:*h)r+="$"+std::to_string(v.size())+"\r\n"+v+"\r\n";return r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
     if(cmd=="HGETALL"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){std::string r="*"+std::to_string(h->size()*2)+"\r\n";for(const auto&[k,v]:*h){r+="$"+std::to_string(k.size())+"\r\n"+k+"\r\n$"+std::to_string(v.size())+"\r\n"+v+"\r\n";}return r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
     if(cmd=="HINCRBY"&&args.size()>=4){int64_t d=0;try{d=std::stoll(args[3]);}catch(...){return"-ERR\r\n";}CacheItem*i=cache.get_item(args[1],now);int64_t val=0;if(!i){cache.put(args[1],std::unordered_map<std::string,std::string>{{args[2],std::to_string(d)}});append_to_aof(args);return":"+std::to_string(d)+"\r\n";}if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){auto it=h->find(args[2]);if(it!=h->end())try{val=std::stoll(it->second);}catch(...){return"-ERR hash value not integer\r\n";}val+=d;(*h)[args[2]]=std::to_string(val);append_to_aof(args);return":"+std::to_string(val)+"\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
+    // ================================================================
+    // SORTED SET commands
+    // ================================================================
+
+    if (cmd == "ZADD" && args.size() >= 4 && (args.size() % 2) == 0) {
+        CacheItem* item = cache.get_item(args[1], now);
+        int added = 0;
+
+        if (!item) {
+            ZSet z;
+            for (size_t i = 2; i < args.size(); i += 2) {
+                double score = 0;
+                try { score = std::stod(args[i]); }
+                catch (...) { return "-ERR value is not a valid float\r\n"; }
+                z.dict[args[i+1]] = score;
+                z.tree.insert({score, args[i+1]});
+                added++;
+            }
+            cache.put(args[1], z);
+        } else {
+            if (auto* z = std::get_if<ZSet>(&item->value)) {
+                for (size_t i = 2; i < args.size(); i += 2) {
+                    double score = 0;
+                    try { score = std::stod(args[i]); }
+                    catch (...) { return "-ERR value is not a valid float\r\n"; }
+
+                    auto it = z->dict.find(args[i+1]);
+                    if (it != z->dict.end()) {
+                        if (it->second != score) {
+                            z->tree.erase({it->second, args[i+1]}); // O(log N)
+                            z->tree.insert({score, args[i+1]});     // O(log N)
+                            it->second = score;
+                        }
+                    } else {
+                        z->dict[args[i+1]] = score;
+                        z->tree.insert({score, args[i+1]});
+                        added++;
+                    }
+                }
+            } else return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+        }
+        append_to_aof(args);
+        return ":" + std::to_string(added) + "\r\n";
+    }
+
+    if (cmd == "ZRANGE" && args.size() >= 4) {
+        CacheItem* item = cache.get_item(args[1], now);
+        if (!item) return "*0\r\n";
+
+        if (auto* z = std::get_if<ZSet>(&item->value)) {
+            int len = z->tree.size();
+            int start = 0, stop = 0;
+            try { start = std::stoi(args[2]); stop = std::stoi(args[3]); }
+            catch (...) { return "-ERR value is not an integer or out of range\r\n"; }
+
+            bool withscores = false;
+            if (args.size() >= 5) {
+                std::string opt = args[4];
+                for (char& c : opt) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+                if (opt == "WITHSCORES") withscores = true;
+            }
+
+            if (start < 0) start = std::max(0, len + start);
+            if (stop < 0) stop = len + stop;
+            stop = std::min(stop, len - 1);
+
+            if (start > stop || start >= len) return "*0\r\n";
+
+            int count = 0;
+            std::string resp = "";
+            auto it = z->tree.begin();
+            std::advance(it, start); 
+
+            for (int i = start; i <= stop && it != z->tree.end(); ++i, ++it) {
+                resp += "$" + std::to_string(it->second.size()) + "\r\n" + it->second + "\r\n";
+                count++;
+                if (withscores) {
+                    std::ostringstream oss;
+                    oss << it->first; 
+                    std::string s_str = oss.str();
+                    resp += "$" + std::to_string(s_str.size()) + "\r\n" + s_str + "\r\n";
+                    count++;
+                }
+            }
+            return "*" + std::to_string(count) + "\r\n" + resp;
+        }
+        return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
+    }
 
     return "-ERR Unknown command '"+args[0]+"'\r\n";
 }
