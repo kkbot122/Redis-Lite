@@ -55,3 +55,6 @@ compile_commands.json
 # OS Specific
 .DS_Store
 Thumbs.db
+
+*.crt
+*.key
