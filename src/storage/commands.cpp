@@ -483,4 +483,61 @@ void KeyValueStore::init_commands() {
         // If all lists are empty, return the secret internal wait flag
         return std::string("*WAIT\r\n"); 
     };
+
+    // ==========================================================
+    // LUA SCRIPTING
+    // ==========================================================
+    command_registry["EVAL"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
+        // Syntax: EVAL "script" numkeys key1 key2 arg1 arg2
+        if (args.size() < 3) return std::string("-ERR wrong number of arguments for 'eval' command\r\n");
+
+        std::string script = args[1];
+        int numkeys = 0;
+        try { numkeys = std::stoi(args[2]); } catch(...) { return std::string("-ERR value is not an integer\r\n"); }
+        if (args.size() < 3 + numkeys) return std::string("-ERR invalid number of arguments\r\n");
+
+        // 1. Setup the KEYS array in Lua
+        lua_newtable(lua_vm);
+        for (int i = 0; i < numkeys; ++i) {
+            lua_pushstring(lua_vm, args[3 + i].c_str());
+            lua_rawseti(lua_vm, -2, i + 1); // Lua is 1-indexed!
+        }
+        lua_setglobal(lua_vm, "KEYS");
+
+        // 2. Setup the ARGV array in Lua
+        lua_newtable(lua_vm);
+        int numargs = args.size() - 3 - numkeys;
+        for (int i = 0; i < numargs; ++i) {
+            lua_pushstring(lua_vm, args[3 + numkeys + i].c_str());
+            lua_rawseti(lua_vm, -2, i + 1);
+        }
+        lua_setglobal(lua_vm, "ARGV");
+
+        // 3. Execute the script!
+        if (luaL_dostring(lua_vm, script.c_str()) != LUA_OK) {
+            std::string err = lua_tostring(lua_vm, -1);
+            lua_pop(lua_vm, 1);
+            return "-ERR Error running script: " + err + "\r\n";
+        }
+
+        // 4. Capture the return value
+        std::string result;
+        if (lua_isstring(lua_vm, -1)) {
+            std::string res = lua_tostring(lua_vm, -1);
+            // If it's already RESP (returned by redis.call), pass it. Otherwise, format it.
+            if (!res.empty() && (res[0] == '+' || res[0] == '-' || res[0] == ':' || res[0] == '$' || res[0] == '*')) {
+                result = res;
+            } else {
+                result = "$" + std::to_string(res.size()) + "\r\n" + res + "\r\n";
+            }
+        } else if (lua_isinteger(lua_vm, -1)) {
+            result = ":" + std::to_string(lua_tointeger(lua_vm, -1)) + "\r\n";
+        } else {
+            result = "$-1\r\n"; // nil
+        }
+        lua_pop(lua_vm, 1);
+
+        append_to_aof(args);
+        return result;
+    };
 }

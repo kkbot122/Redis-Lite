@@ -1,13 +1,19 @@
 cmake_minimum_required(VERSION 3.14)
+cmake_policy(SET CMP0135 NEW) # Silences the FetchContent timestamp warning
+
 project(RedisLite)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(include)
+
+# Find OpenSSL
 find_package(OpenSSL REQUIRED)
 include_directories(${OPENSSL_INCLUDE_DIR})
 
-
+# Find Lua
+find_package(Lua REQUIRED)
+include_directories(${LUA_INCLUDE_DIR})
 
 # ==========================================
 # 1. CORE SERVERS
@@ -23,7 +29,8 @@ add_executable(redis-server
     src/utils/config.cpp   
 )
 
-target_link_libraries(redis-server OpenSSL::SSL OpenSSL::Crypto)
+# Link OpenSSL and Lua to the main server
+target_link_libraries(redis-server OpenSSL::SSL OpenSSL::Crypto ${LUA_LIBRARIES})
 
 add_executable(redis-router 
     src/network/router.cpp
@@ -58,8 +65,8 @@ add_executable(run_tests
     src/utils/config.cpp       
 )
 
-# Link the Google Test framework to our test executable
-target_link_libraries(run_tests gtest_main)
+# FIXED: Link Google Test AND OpenSSL/Lua to the test executable!
+target_link_libraries(run_tests gtest_main OpenSSL::SSL OpenSSL::Crypto ${LUA_LIBRARIES})
 
 # Tell CMake this is a test suite
 include(GoogleTest)

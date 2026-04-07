@@ -9,6 +9,7 @@
 // ============================================================
 KeyValueStore::KeyValueStore() : cache(Config::max_memory) {
     init_commands(); // Boot up the O(1) Command Registry
+    init_lua();
     start_time_ms = get_current_time_ms();
     
     rdb_load_snapshot(Config::rdb_file);
@@ -23,6 +24,44 @@ KeyValueStore::KeyValueStore() : cache(Config::max_memory) {
 
 KeyValueStore::~KeyValueStore() {
     if (aof_file.is_open()) aof_file.close();
+    if (lua_vm) lua_close(lua_vm);
+}
+
+// ============================================================
+// LUA VIRTUAL MACHINE INITIALIZATION
+// ============================================================
+void KeyValueStore::init_lua() {
+    lua_vm = luaL_newstate();
+    luaL_openlibs(lua_vm); // Load standard Lua math/string libraries
+
+    // Create the global 'redis' table in Lua
+    lua_newtable(lua_vm); 
+    
+    // Push the 'this' pointer into Lua so the static function knows which database to talk to
+    lua_pushlightuserdata(lua_vm, this); 
+    lua_pushcclosure(lua_vm, lua_redis_call, 1); 
+    lua_setfield(lua_vm, -2, "call"); // Maps 'redis.call' to our C++ function
+    
+    lua_setglobal(lua_vm, "redis"); 
+}
+
+int KeyValueStore::lua_redis_call(lua_State* L) {
+    // 1. Grab the 'this' pointer we hid inside Lua
+    KeyValueStore* store = static_cast<KeyValueStore*>(lua_touserdata(L, lua_upvalueindex(1)));
+
+    // 2. Unpack the arguments Lua gave us (e.g., "SET", "mykey", "10")
+    int argc = lua_gettop(L);
+    std::vector<std::string> args;
+    for (int i = 1; i <= argc; ++i) {
+        if (lua_isstring(L, i)) args.push_back(lua_tostring(L, i));
+    }
+
+    // 3. Execute the command in the native C++ engine! (Defaulting to RESP2)
+    std::string resp = store->execute_command_locked(args, 2);
+
+    // 4. Send the result back to Lua
+    lua_pushstring(L, resp.c_str());
+    return 1; // We are returning 1 value
 }
 
 // ============================================================
@@ -116,7 +155,7 @@ bool KeyValueStore::is_write_command(const std::string& cmd) {
         "SET","SETEX","GETSET","APPEND","DEL","RENAME","EXPIRE","PEXPIRE","PEXPIREAT",
         "PERSIST","INCR","INCRBY","DECR","DECRBY","LPUSH","RPUSH","LPOP","RPOP",
         "SADD","SREM","HSET","HDEL","HINCRBY","HINCRBYFLOAT","HSETNX","ZADD", 
-        "FLUSHDB", "BGREWRITEAOF"
+        "FLUSHDB", "BGREWRITEAOF", "EVAL"
     };
     return writes.count(cmd) > 0;
 }
@@ -129,7 +168,6 @@ void KeyValueStore::track_mutations(const std::vector<std::string>& args) {
     std::string cmd = args[0];
     for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
-    // THE FIX: Treat is_write_command as a function, not a set!
     if (!is_write_command(cmd)) return;
 
     if (cmd == "FLUSHDB") {
@@ -139,7 +177,15 @@ void KeyValueStore::track_mutations(const std::vector<std::string>& args) {
     } else if (cmd == "RENAME" && args.size() >= 3) {
         key_versions[args[1]]++; cache.recalculate_size(args[1]);
         key_versions[args[2]]++; cache.recalculate_size(args[2]);
-    } else if (args.size() > 1) {
+    } else if (cmd == "EVAL" && args.size() >= 3) {
+        // NEW: Bump versions for any key the Lua script touches!
+        int numkeys = 0; try { numkeys = std::stoi(args[2]); } catch(...) {}
+        for (int i = 0; i < numkeys && 3 + i < args.size(); ++i) {
+            key_versions[args[3 + i]]++;
+            cache.recalculate_size(args[3 + i]);
+        }
+    }   
+    else if (args.size() > 1) {
         key_versions[args[1]]++; 
         cache.recalculate_size(args[1]); 
     }

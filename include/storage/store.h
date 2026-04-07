@@ -8,7 +8,14 @@
 #include <mutex>
 #include <atomic>
 #include <unordered_map>
-#include <functional> // NEW: For our Command Handlers!
+#include <functional> 
+#include <lua.hpp>
+
+extern "C" {
+    #include <lua.h>
+    #include <lualib.h>
+    #include <lauxlib.h>
+}
 
 struct SlowlogEntry {
     int64_t                  id;
@@ -26,6 +33,9 @@ struct TxState {
 
 class KeyValueStore {
 private:
+    lua_State* lua_vm = nullptr;
+    void init_lua();
+    static int lua_redis_call(lua_State* L);
     LRUCache cache;
     std::fstream aof_file;
     bool loading_from_aof = false;
