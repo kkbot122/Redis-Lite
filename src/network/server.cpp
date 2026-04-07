@@ -21,17 +21,6 @@
 static std::atomic<bool> g_shutdown{false};
 static void signal_handler(int) { g_shutdown.store(true); }
 
-static const std::unordered_set<std::string> WRITE_COMMANDS = {
-    "SET","SETEX","GETSET","APPEND","DEL","RENAME",
-    "EXPIRE","PEXPIRE","PEXPIREAT","PERSIST",
-    "INCR","INCRBY","DECR","DECRBY",
-    "LPUSH","RPUSH","LPOP","RPOP",
-    "SADD","SREM","SMEMBERS",
-    "HSET","HDEL","HINCRBY","HINCRBYFLOAT","HSETNX","HGETALL",
-    "FLUSHDB","BGREWRITEAOF",
-    "ZADD"
-};
-
 // ============================================================
 // RESP frame parser
 // ============================================================
@@ -496,7 +485,9 @@ void RedisServer::handle_client_data(int fd) {
             }
         }
 
-        if (leader_port == 0 && WRITE_COMMANDS.count(cmd) && response[0] != '-') replicate(args);
+        // Change this line:
+if (leader_port == 0 && KeyValueStore::is_write_command(cmd) && response[0] != '-')
+    replicate(args);
     }
 }
 

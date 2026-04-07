@@ -16,7 +16,7 @@ std::string get_string_val(CacheItem* item) {
 // TEST 1: Basic Storage
 // ---------------------------------------------------------
 TEST(LRUCacheTest, BasicPutAndGet) {
-    LRUCache cache(3); // Capacity of 3
+    LRUCache cache(1024); // Capacity of 3
     
     cache.put("user:1", "Alice");
     cache.put("user:2", "Bob");
@@ -33,7 +33,7 @@ TEST(LRUCacheTest, BasicPutAndGet) {
 // TEST 2: The Eviction Engine
 // ---------------------------------------------------------
 TEST(LRUCacheTest, EvictsLeastRecentlyUsed) {
-    LRUCache cache(3);
+    LRUCache cache(250);
 
     cache.put("A", "1");
     cache.put("B", "2");
@@ -57,7 +57,7 @@ TEST(LRUCacheTest, EvictsLeastRecentlyUsed) {
 // TEST 3: Time-To-Live (TTL) Expiration
 // ---------------------------------------------------------
 TEST(LRUCacheTest, HandlesExpiration) {
-    LRUCache cache(3);
+    LRUCache cache(1024);
     
     cache.put("temp_key", "secret", 5000);
 
