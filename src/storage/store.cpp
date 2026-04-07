@@ -764,6 +764,35 @@ std::string KeyValueStore::execute_command_locked(const std::vector<std::string>
     return "-ERR Unknown command '"+args[0]+"'\r\n";
 }
 
+// NEW: Helper to identify which keys were modified so we can bump their version
+void KeyValueStore::bump_versions(const std::vector<std::string>& args) {
+    if (args.empty()) return;
+    std::string cmd = args[0];
+    for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
+
+    static const std::unordered_set<std::string> write_cmds = {
+        "SET","SETEX","GETSET","APPEND","DEL","RENAME",
+        "EXPIRE","PEXPIRE","PEXPIREAT","PERSIST",
+        "INCR","INCRBY","DECR","DECRBY",
+        "LPUSH","RPUSH","LPOP","RPOP",
+        "SADD","SREM","HSET","HDEL","HINCRBY","HINCRBYFLOAT","HSETNX",
+        "ZADD", "FLUSHDB", "BGREWRITEAOF"
+    };
+
+    if (!write_cmds.count(cmd)) return;
+
+    if (cmd == "FLUSHDB") {
+        global_flush_version++; // Automatically breaks ALL active watches
+    } else if (cmd == "DEL") {
+        for (size_t i = 1; i < args.size(); ++i) key_versions[args[i]]++;
+    } else if (cmd == "RENAME" && args.size() >= 3) {
+        key_versions[args[1]]++;
+        key_versions[args[2]]++;
+    } else if (args.size() > 1) {
+        key_versions[args[1]]++; // 95% of commands map the key to args[1]
+    }
+}
+
 // ============================================================
 // Public thread-safe entry point
 // ============================================================
@@ -785,35 +814,90 @@ std::string KeyValueStore::execute_command(const std::vector<std::string>& args,
     if (!Config::requirepass.empty() && !authenticated)
         return "-NOAUTH Authentication required\r\n";
 
+    // ============================================================
+    // OPTIMISTIC LOCKING: WATCH / UNWATCH
+    // ============================================================
+    if (cmd == "WATCH") {
+        if (tx.active) return "-ERR WATCH inside MULTI is not allowed\r\n";
+        if (args.size() < 2) return "-ERR wrong number of arguments for 'watch' command\r\n";
+        
+        std::shared_lock<std::shared_mutex> lock(mtx);
+        for (size_t i = 1; i < args.size(); ++i) {
+            // Record the exact version of the key at the time of WATCH
+            tx.watched_keys[args[i]] = key_versions[args[i]] + global_flush_version.load();
+        }
+        return "+OK\r\n";
+    }
+    if (cmd == "UNWATCH") {
+        tx.watched_keys.clear();
+        return "+OK\r\n";
+    }
+
+    // ============================================================
+    // TRANSACTION QUEUE
+    // ============================================================
     if (cmd == "MULTI") {
         if (tx.active) return "-ERR MULTI calls can not be nested\r\n";
         tx.active = true; tx.errored = false; tx.queue.clear(); return "+OK\r\n";
     }
     if (cmd == "DISCARD") {
         if (!tx.active) return "-ERR DISCARD without MULTI\r\n";
-        tx.active = false; tx.errored = false; tx.queue.clear(); return "+OK\r\n";
+        tx.active = false; tx.errored = false; tx.queue.clear(); tx.watched_keys.clear(); return "+OK\r\n";
     }
     if (cmd == "EXEC") {
         if (!tx.active) return "-ERR EXEC without MULTI\r\n";
-        if (tx.errored) { tx.active=false; tx.queue.clear(); return "-EXECABORT Transaction discarded because of previous errors\r\n"; }
+        if (tx.errored) { 
+            tx.active=false; tx.queue.clear(); tx.watched_keys.clear(); 
+            return "-EXECABORT Transaction discarded because of previous errors\r\n"; 
+        }
+        
         std::unique_lock<std::shared_mutex> lock(mtx);
+
+        // 1. Verify all watched keys haven't been modified by another client
+        for (const auto& [k, expected_version] : tx.watched_keys) {
+            uint64_t current_version = key_versions[k] + global_flush_version.load();
+            if (current_version != expected_version) {
+                // ABORT! Another client touched this key.
+                tx.active = false; tx.queue.clear(); tx.watched_keys.clear();
+                return "*-1\r\n"; // RESP Null Array indicating aborted transaction
+            }
+        }
+
+        // 2. Safely execute the queued commands atomically
         std::string r = "*"+std::to_string(tx.queue.size())+"\r\n";
-        for (const auto& qa : tx.queue) r += execute_command_locked(qa);
-        tx.active = false; tx.queue.clear(); return r;
+        for (const auto& qa : tx.queue) {
+            std::string res = execute_command_locked(qa);
+            r += res;
+            if (res[0] != '-') bump_versions(qa); // Increment version on success
+        }
+        
+        tx.active = false; tx.queue.clear(); tx.watched_keys.clear(); return r;
     }
+    
     if (tx.active) { tx.queue.push_back(args); return "+QUEUED\r\n"; }
 
+    // ============================================================
+    // STANDARD EXECUTION
+    // ============================================================
     static const std::unordered_set<std::string> read_only = {
         "GET","EXISTS","TYPE","TTL","PTTL","STRLEN","LRANGE","LLEN",
         "SMEMBERS","SISMEMBER","SCARD","HGET","HMGET","HEXISTS","HLEN",
         "HKEYS","HVALS","HGETALL","DBSIZE","PING","INFO","SCAN","KEYS",
-        "SLOWLOG","CONFIG","LASTSAVE"
+        "SLOWLOG","CONFIG","LASTSAVE", "ZRANGE"
     };
 
     int64_t t0 = get_current_time_ms();
     std::string result;
-    if (read_only.count(cmd)) { std::shared_lock<std::shared_mutex> lk(mtx); result = execute_command_locked(args); }
-    else                      { std::unique_lock<std::shared_mutex> lk(mtx); result = execute_command_locked(args); }
+    
+    if (read_only.count(cmd)) { 
+        std::shared_lock<std::shared_mutex> lk(mtx); 
+        result = execute_command_locked(args); 
+    } else { 
+        std::unique_lock<std::shared_mutex> lk(mtx); 
+        result = execute_command_locked(args); 
+        if (result[0] != '-') bump_versions(args); // Increment version on success
+    }
+    
     record_slowlog(args, get_current_time_ms() - t0);
     return result;
 }

@@ -20,6 +20,7 @@ struct TxState {
     bool                                  active  = false;
     bool                                  errored = false;
     std::vector<std::vector<std::string>> queue;
+    std::unordered_map<std::string, uint64_t> watched_keys;
 };
 
 class KeyValueStore {
@@ -30,11 +31,16 @@ private:
 
     mutable std::shared_mutex mtx;
 
+    // NEW: Key modification tracking for WATCH
+    std::unordered_map<std::string, uint64_t> key_versions; 
+    std::atomic<uint64_t>                     global_flush_version{0};
+    void bump_versions(const std::vector<std::string>& args);
+
     int64_t              start_time_ms;
     std::atomic<int64_t> total_commands{0};
     std::atomic<bool>    rewrite_in_progress{false};
     std::atomic<bool>    rdb_save_in_progress{false};
-    std::atomic<int64_t> last_save_time{0};      // unix seconds of last successful SAVE
+    std::atomic<int64_t> last_save_time{0};      
 
     mutable std::mutex       slowlog_mtx;
     std::deque<SlowlogEntry> slowlog;
@@ -48,7 +54,6 @@ private:
     std::string build_info(const std::string& section) const;
     void        record_slowlog(const std::vector<std::string>& args, int64_t duration_ms);
 
-    // RDB helpers (binary snapshot format)
     bool        rdb_save_snapshot(const std::string& path,
                                   const std::vector<CacheItem>& items) const;
     bool        rdb_load_snapshot(const std::string& path);
