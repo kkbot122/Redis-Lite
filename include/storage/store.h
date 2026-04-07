@@ -49,7 +49,7 @@ private:
     // =======================================================
     // NEW: The Command Registry
     // =======================================================
-    using CommandHandler = std::function<std::string(const std::vector<std::string>&, int64_t)>;
+    using CommandHandler = std::function<std::string(const std::vector<std::string>&, int64_t, int)>;
     std::unordered_map<std::string, CommandHandler> command_registry;
     void init_commands(); // Registers all functions on boot
     // =======================================================
@@ -57,7 +57,7 @@ private:
     int64_t     get_current_time_ms() const;
     void        append_to_aof(const std::vector<std::string>& args);
     void        load_from_aof();
-    std::string execute_command_locked(const std::vector<std::string>& args);
+    std::string execute_command_locked(const std::vector<std::string>& args, int resp_version =2);
     std::string serialize_item_to_resp(const CacheItem& item) const;
     std::string build_info(const std::string& section) const;
     void        record_slowlog(const std::vector<std::string>& args, int64_t duration_ms);
@@ -71,7 +71,7 @@ public:
     ~KeyValueStore();
 
     std::string execute_command(const std::vector<std::string>& args,
-                                TxState& tx, bool& authenticated);
+                                TxState& tx, bool& authenticated, int resp_version=2);
     
     void        maybe_auto_save();
 };

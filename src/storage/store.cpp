@@ -99,14 +99,14 @@ void KeyValueStore::record_slowlog(const std::vector<std::string>& args, int64_t
 // ============================================================
 // Internal Command Engine (O(1) Dispatcher)
 // ============================================================
-std::string KeyValueStore::execute_command_locked(const std::vector<std::string>& args) {
+std::string KeyValueStore::execute_command_locked(const std::vector<std::string>& args, int resp_version) {
     if (args.empty()) return "-ERR Empty command\r\n";
     std::string cmd = args[0];
     for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
     auto it = command_registry.find(cmd);
     if (it != command_registry.end()) {
-        return it->second(args, get_current_time_ms()); 
+        return it->second(args, get_current_time_ms(), resp_version); // <--- Add resp_version here
     }
     return "-ERR Unknown command '" + args[0] + "'\r\n";
 }
@@ -144,7 +144,7 @@ void KeyValueStore::track_mutations(const std::vector<std::string>& args) {
 // Public Thread-Safe Entry Point (ACID Transactions)
 // ============================================================
 std::string KeyValueStore::execute_command(const std::vector<std::string>& args,
-                                            TxState& tx, bool& authenticated) {
+                                            TxState& tx, bool& authenticated, int resp_version) {
     if (args.empty()) return "-ERR Empty command\r\n";
     ++total_commands;
 
@@ -188,7 +188,7 @@ std::string KeyValueStore::execute_command(const std::vector<std::string>& args,
 
         std::string r = "*"+std::to_string(tx.queue.size())+"\r\n";
         for (const auto& qa : tx.queue) {
-            std::string res = execute_command_locked(qa);
+            std::string res = execute_command_locked(qa, resp_version);
             r += res;
             if (res[0] != '-') track_mutations(qa);
         }
@@ -202,7 +202,7 @@ std::string KeyValueStore::execute_command(const std::vector<std::string>& args,
     
     { 
         std::unique_lock<std::shared_mutex> lk(mtx); 
-        result = execute_command_locked(args); 
+        result = execute_command_locked(args, resp_version); 
         if (result[0] != '-') track_mutations(args); 
     }
     

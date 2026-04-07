@@ -11,22 +11,22 @@ void KeyValueStore::init_commands() {
     // ==========================================================
     // SERVER & ADMIN COMMANDS
     // ==========================================================
-    command_registry["PING"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["PING"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         return args.size() >= 2 ? "$" + std::to_string(args[1].size()) + "\r\n" + args[1] + "\r\n" : "+PONG\r\n";
     };
 
-    command_registry["INFO"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["INFO"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         std::string s = args.size() >= 2 ? args[1] : "";
         for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
         std::string p = build_info(s);
         return "$" + std::to_string(p.size()) + "\r\n" + p + "\r\n";
     };
 
-    command_registry["DBSIZE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["DBSIZE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         return ":" + std::to_string(cache.size()) + "\r\n";
     };
 
-    command_registry["FLUSHDB"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["FLUSHDB"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         cache = LRUCache(Config::max_memory); 
         append_to_aof(args); 
         return std::string("+OK\r\n");
@@ -35,7 +35,7 @@ void KeyValueStore::init_commands() {
     // ==========================================================
     // PERSISTENCE COMMANDS
     // ==========================================================
-    command_registry["SAVE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["SAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         auto snap = cache.get_all_items(now);
         if (rdb_save_snapshot(Config::rdb_file, snap)) {
             last_save_time.store(now / 1000);
@@ -44,7 +44,7 @@ void KeyValueStore::init_commands() {
         return std::string("-ERR RDB save failed\r\n");
     };
 
-    command_registry["BGSAVE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["BGSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (rdb_save_in_progress.load()) return std::string("+Background save already in progress\r\n");
         auto snap = cache.get_all_items(now);
         rdb_save_in_progress.store(true);
@@ -61,11 +61,11 @@ void KeyValueStore::init_commands() {
         return std::string("+Background saving started\r\n");
     };
 
-    command_registry["LASTSAVE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["LASTSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         return ":" + std::to_string(last_save_time.load()) + "\r\n";
     };
 
-    command_registry["BGREWRITEAOF"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["BGREWRITEAOF"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (rewrite_in_progress.load()) return std::string("+Background AOF rewrite already in progress\r\n");
         auto snap = cache.get_all_items(now);
         rewrite_in_progress.store(true);
@@ -92,7 +92,7 @@ void KeyValueStore::init_commands() {
     // ==========================================================
     // KEYSPACE COMMANDS
     // ==========================================================
-    command_registry["DEL"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["DEL"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         int d = 0;
         for (size_t i = 1; i < args.size(); ++i) if (cache.remove(args[i])) ++d;
@@ -100,12 +100,12 @@ void KeyValueStore::init_commands() {
         return ":" + std::to_string(d) + "\r\n";
     };
 
-    command_registry["EXISTS"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["EXISTS"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         return cache.exists(args[1], now) ? std::string(":1\r\n") : std::string(":0\r\n");
     };
 
-    command_registry["TYPE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["TYPE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* item = cache.get_item(args[1], now);
         if (!item) return std::string("+none\r\n");
@@ -117,7 +117,7 @@ void KeyValueStore::init_commands() {
         return std::string("+none\r\n");
     };
 
-    command_registry["RENAME"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["RENAME"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* item = cache.get_item(args[1], now);
         if (!item) return std::string("-ERR no such key\r\n");
@@ -127,7 +127,7 @@ void KeyValueStore::init_commands() {
         return std::string("+OK\r\n");
     };
 
-    command_registry["SCAN"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["SCAN"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         size_t cursor = 0, count = 10; std::string pat = "*";
         try { cursor = std::stoull(args[1]); } catch (...) { return std::string("-ERR invalid cursor\r\n"); }
@@ -148,7 +148,7 @@ void KeyValueStore::init_commands() {
     // ==========================================================
     // TTL COMMANDS
     // ==========================================================
-    command_registry["TTL"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["TTL"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now);
         if (!i) return std::string(":-2\r\n");
@@ -157,7 +157,7 @@ void KeyValueStore::init_commands() {
         return ":" + std::to_string(s > 0 ? s : 0) + "\r\n";
     };
 
-    command_registry["PTTL"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["PTTL"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now);
         if (!i) return std::string(":-2\r\n");
@@ -166,7 +166,7 @@ void KeyValueStore::init_commands() {
         return ":" + std::to_string(ms > 0 ? ms : 0) + "\r\n";
     };
 
-    command_registry["EXPIRE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["EXPIRE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         int64_t s = 0; try { s = std::stoll(args[2]); } catch (...) { return std::string("-ERR\r\n"); }
         bool ok = cache.set_expiry(args[1], now + s * 1000);
@@ -174,7 +174,7 @@ void KeyValueStore::init_commands() {
         return ok ? std::string(":1\r\n") : std::string(":0\r\n");
     };
 
-    command_registry["PEXPIRE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["PEXPIRE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         int64_t ms = 0; try { ms = std::stoll(args[2]); } catch (...) { return std::string("-ERR\r\n"); }
         bool ok = cache.set_expiry(args[1], now + ms);
@@ -182,7 +182,7 @@ void KeyValueStore::init_commands() {
         return ok ? std::string(":1\r\n") : std::string(":0\r\n");
     };
 
-    command_registry["PERSIST"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["PERSIST"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         bool ok = cache.set_expiry(args[1], 0);
         if (ok) append_to_aof(args);
@@ -192,7 +192,7 @@ void KeyValueStore::init_commands() {
     // ==========================================================
     // STRING COMMANDS
     // ==========================================================
-    command_registry["SET"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["SET"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         int64_t exp = 0;
         for (size_t i = 3; i + 1 < args.size(); ++i) {
@@ -207,7 +207,7 @@ void KeyValueStore::init_commands() {
         return std::string("+OK\r\n");
     };
 
-    command_registry["GET"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["GET"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now);
         if (!i) return std::string("$-1\r\n");
@@ -225,20 +225,20 @@ void KeyValueStore::init_commands() {
         val += delta; cache.put(key, std::to_string(val)); return ":" + std::to_string(val) + "\r\n";
     };
 
-    command_registry["INCR"] = [this, num_op](const std::vector<std::string>& args, int64_t now) {
+    command_registry["INCR"] = [this, num_op](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         auto r = num_op(args[1], 1, now); if (r[0] == ':') append_to_aof(args); return r;
     };
-    command_registry["DECR"] = [this, num_op](const std::vector<std::string>& args, int64_t now) {
+    command_registry["DECR"] = [this, num_op](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         auto r = num_op(args[1], -1, now); if (r[0] == ':') append_to_aof(args); return r;
     };
-    command_registry["INCRBY"] = [this, num_op](const std::vector<std::string>& args, int64_t now) {
+    command_registry["INCRBY"] = [this, num_op](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         int64_t d = 0; try { d = std::stoll(args[2]); } catch (...) { return std::string("-ERR\r\n"); }
         auto r = num_op(args[1], d, now); if (r[0] == ':') append_to_aof(args); return r;
     };
-    command_registry["DECRBY"] = [this, num_op](const std::vector<std::string>& args, int64_t now) {
+    command_registry["DECRBY"] = [this, num_op](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         int64_t d = 0; try { d = std::stoll(args[2]); } catch (...) { return std::string("-ERR\r\n"); }
         auto r = num_op(args[1], -d, now); if (r[0] == ':') append_to_aof(args); return r;
@@ -247,7 +247,7 @@ void KeyValueStore::init_commands() {
     // ==========================================================
     // LIST COMMANDS
     // ==========================================================
-    command_registry["LPUSH"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["LPUSH"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); int nl = 0;
         if (!i) {
@@ -261,7 +261,7 @@ void KeyValueStore::init_commands() {
         append_to_aof(args); return ":" + std::to_string(nl) + "\r\n";
     };
 
-    command_registry["RPUSH"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["RPUSH"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); int nl = 0;
         if (!i) {
@@ -275,7 +275,7 @@ void KeyValueStore::init_commands() {
         append_to_aof(args); return ":" + std::to_string(nl) + "\r\n";
     };
 
-    command_registry["LPOP"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["LPOP"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); if (!i) return std::string("$-1\r\n");
         if (auto* l = std::get_if<std::list<std::string>>(&i->value)) {
@@ -286,7 +286,7 @@ void KeyValueStore::init_commands() {
         return std::string("-WRONGTYPE\r\n");
     };
 
-    command_registry["RPOP"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["RPOP"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); if (!i) return std::string("$-1\r\n");
         if (auto* l = std::get_if<std::list<std::string>>(&i->value)) {
@@ -297,7 +297,7 @@ void KeyValueStore::init_commands() {
         return std::string("-WRONGTYPE\r\n");
     };
 
-    command_registry["LRANGE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["LRANGE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 4) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); if (!i) return std::string("*0\r\n");
         if (auto* l = std::get_if<std::list<std::string>>(&i->value)) {
@@ -317,9 +317,9 @@ void KeyValueStore::init_commands() {
     };
 
     // ==========================================================
-    // SET COMMANDS
+    // SET COMMANDS (UPDATED FOR RESP3)
     // ==========================================================
-    command_registry["SADD"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["SADD"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); int a = 0;
         if (!i) {
@@ -333,10 +333,24 @@ void KeyValueStore::init_commands() {
         append_to_aof(args); return ":" + std::to_string(a) + "\r\n";
     };
 
+    command_registry["SMEMBERS"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
+        if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
+        CacheItem* i = cache.get_item(args[1], now);
+        if (!i) return std::string("*0\r\n");
+        if (auto* s = std::get_if<std::unordered_set<std::string>>(&i->value)) {
+            // RESP3 uses '~' for Sets, RESP2 uses '*' for Arrays
+            std::string prefix = (resp_version == 3) ? "~" : "*";
+            std::string r = prefix + std::to_string(s->size()) + "\r\n";
+            for (const auto& m : *s) r += "$" + std::to_string(m.size()) + "\r\n" + m + "\r\n";
+            return r;
+        }
+        return std::string("-WRONGTYPE\r\n");
+    };
+
     // ==========================================================
-    // HASH COMMANDS
+    // HASH COMMANDS (UPDATED FOR RESP3)
     // ==========================================================
-    command_registry["HSET"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["HSET"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 4 || (args.size() % 2) != 0) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); int a = 0;
         if (!i) {
@@ -351,7 +365,7 @@ void KeyValueStore::init_commands() {
         append_to_aof(args); return ":" + std::to_string(a) + "\r\n";
     };
 
-    command_registry["HGET"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["HGET"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* i = cache.get_item(args[1], now); if (!i) return std::string("$-1\r\n");
         if (auto* h = std::get_if<std::unordered_map<std::string, std::string>>(&i->value)) {
@@ -361,10 +375,34 @@ void KeyValueStore::init_commands() {
         return std::string("-WRONGTYPE\r\n");
     };
 
+    command_registry["HGETALL"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
+        if (args.size() < 2) return std::string("-ERR wrong number of arguments\r\n");
+        CacheItem* i = cache.get_item(args[1], now);
+        if (!i) return std::string("*0\r\n");
+        if (auto* h = std::get_if<std::unordered_map<std::string, std::string>>(&i->value)) {
+            if (resp_version == 3) {
+                // RESP3 Map format (%)
+                std::string r = "%" + std::to_string(h->size()) + "\r\n";
+                for (const auto& [k, v] : *h) {
+                    r += "$" + std::to_string(k.size()) + "\r\n" + k + "\r\n$" + std::to_string(v.size()) + "\r\n" + v + "\r\n";
+                }
+                return r;
+            } else {
+                // RESP2 Array format (*)
+                std::string r = "*" + std::to_string(h->size() * 2) + "\r\n";
+                for (const auto& [k, v] : *h) {
+                    r += "$" + std::to_string(k.size()) + "\r\n" + k + "\r\n$" + std::to_string(v.size()) + "\r\n" + v + "\r\n";
+                }
+                return r;
+            }
+        }
+        return std::string("-WRONGTYPE\r\n");
+    };
+
     // ==========================================================
     // SORTED SET COMMANDS
     // ==========================================================
-    command_registry["ZADD"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["ZADD"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 4 || (args.size() % 2) != 0) return std::string("-ERR wrong number of arguments\r\n");
         std::vector<std::pair<double, std::string>> new_elements;
         for (size_t i = 2; i < args.size(); i += 2) {
@@ -392,7 +430,7 @@ void KeyValueStore::init_commands() {
         return ":" + std::to_string(added) + "\r\n";
     };
 
-    command_registry["ZRANGE"] = [this](const std::vector<std::string>& args, int64_t now) {
+    command_registry["ZRANGE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 4) return std::string("-ERR wrong number of arguments\r\n");
         CacheItem* item = cache.get_item(args[1], now);
         if (!item) return std::string("*0\r\n");
@@ -419,7 +457,10 @@ void KeyValueStore::init_commands() {
         return std::string("-WRONGTYPE\r\n");
     };
 
-    command_registry["BLPOP"] = [this](const std::vector<std::string>& args, int64_t now) {
+    // ==========================================================
+    // BLOCKING QUEUE COMMANDS
+    // ==========================================================
+    command_registry["BLPOP"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
         
         // Loop through the provided keys to see if any have data

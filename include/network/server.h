@@ -17,6 +17,7 @@ struct ClientState {
     bool                            authenticated = false;
     std::unordered_set<std::string> subscriptions;
     int64_t                         repl_offset   = 0;  // last confirmed offset (replicas)
+    int resp_version = 2;
 };
 
 class RedisServer {

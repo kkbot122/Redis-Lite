@@ -421,7 +421,7 @@ void RedisServer::run() {
 
     Logger::info("Shutdown — saving RDB and closing connections.");
     TxState tx; bool auth = true;
-    store.execute_command({"SAVE"}, tx, auth);
+    store.execute_command({"SAVE"}, tx, auth, 2);
     std::vector<int> all_fds;
     for (const auto& [fd,_] : clients) all_fds.push_back(fd);
     for (int fd : all_fds) close_client(fd);
@@ -470,6 +470,8 @@ void RedisServer::handle_client_data(int fd) {
 
     if (fd == leader_fd) last_heartbeat = get_time_ms();
 
+    
+
     auto& state = clients[fd];
     while (!state.read_buf.empty()) {
         std::vector<std::string> args;
@@ -490,12 +492,32 @@ void RedisServer::handle_client_data(int fd) {
             continue;
         }
 
+        if (cmd == "HELLO") {
+            int v = 2;
+            if (args.size() >= 2) {
+                try { v = std::stoi(args[1]); } catch (...) {}
+            }
+            
+            if (v == 3) {
+                state.resp_version = 3;
+                // RESP3 Map format (%)
+                std::string resp = "%2\r\n$6\r\nserver\r\n$10\r\nredis-lite\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n";
+                send(fd, resp.c_str(), resp.size(), 0);
+            } else {
+                state.resp_version = 2;
+                // RESP2 Array format (*)
+                std::string resp = "*4\r\n$6\r\nserver\r\n$10\r\nredis-lite\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n";
+                send(fd, resp.c_str(), resp.size(), 0);
+            }
+            continue;
+        }
+
         if (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE" || cmd == "PUBLISH") {
             handle_pubsub(fd, args);
             continue;
         }
 
-        std::string response = store.execute_command(args, state.tx, state.authenticated);
+        std::string response = store.execute_command(args, state.tx, state.authenticated, state.resp_version);
 
         // ============================================================
         // ASYNC WAKE-UP WIDGET (BLPOP INTERCEPTOR)
@@ -531,7 +553,7 @@ void RedisServer::handle_client_data(int fd) {
                 // Internally fire the BLPOP command on their behalf to grab the fresh data
                 TxState dummy_tx; bool dummy_auth = true;
                 std::vector<std::string> wake_args = {"BLPOP", list_key, "0"};
-                std::string wake_response = store.execute_command(wake_args, dummy_tx, dummy_auth);
+                std::string wake_response = store.execute_command(wake_args, dummy_tx, dummy_auth, 2);
 
                 // Shoot the data to the woken client!
                 send(parked_fd, wake_response.c_str(), wake_response.size(), 0);
