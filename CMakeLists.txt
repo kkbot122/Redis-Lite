@@ -13,6 +13,7 @@ add_executable(redis-server
     src/network/server.cpp 
     src/storage/store.cpp
     src/storage/commands.cpp
+    src/storage/persistence.cpp
     src/storage/lru_cache.cpp
     src/utils/logger.cpp   
     src/utils/config.cpp   
@@ -45,6 +46,7 @@ add_executable(run_tests
     src/storage/lru_cache.cpp 
     src/storage/store.cpp  
     src/storage/commands.cpp    
+    src/storage/persistence.cpp
     src/network/hash_ring.cpp  
     src/utils/logger.cpp
     src/utils/config.cpp       
