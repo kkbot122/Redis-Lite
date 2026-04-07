@@ -64,6 +64,7 @@ static bool rdouble(std::ifstream& f, double& v) { return static_cast<bool>(f.re
 // ============================================================
 
 KeyValueStore::KeyValueStore() : cache(Config::max_memory) {
+    init_commands();
     start_time_ms = get_current_time_ms();
     // Prefer RDB if it exists and is newer than the AOF.
     rdb_load_snapshot(Config::rdb_file);
@@ -386,6 +387,8 @@ std::string KeyValueStore::build_info(const std::string& section) const {
     }
     if (all_sec || section == "memory") {
         info += sec("Memory");
+        info += kv ("used_memory",       cache.memory_usage()); // Shows exact bytes!
+        info += kv ("maxmemory",         Config::max_memory);
         info += kv ("used_memory_keys", nkeys);
         info += kv ("maxmemory_keys",   Config::max_memory);
         info += kvs("maxmemory_policy", "allkeys-lru");
@@ -426,346 +429,22 @@ void KeyValueStore::record_slowlog(const std::vector<std::string>& args, int64_t
 }
 
 // ============================================================
-// Internal dispatch
+// Internal Command Routing (O(1) Dispatcher)
 // ============================================================
-
 std::string KeyValueStore::execute_command_locked(const std::vector<std::string>& args) {
     if (args.empty()) return "-ERR Empty command\r\n";
     std::string cmd = args[0];
     for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-    const int64_t now = get_current_time_ms();
-
-    if (cmd == "PING")
-        return args.size() >= 2
-            ? "$"+std::to_string(args[1].size())+"\r\n"+args[1]+"\r\n" : "+PONG\r\n";
-
-    if (cmd == "INFO") {
-        std::string s = args.size() >= 2 ? args[1] : "";
-        for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-        std::string p = build_info(s);
-        return "$"+std::to_string(p.size())+"\r\n"+p+"\r\n";
+    
+    auto it = command_registry.find(cmd);
+    if (it != command_registry.end()) {
+        return it->second(args, get_current_time_ms()); 
     }
-
-    // ---------------------------------------- SAVE / BGSAVE / LASTSAVE / BGREWRITEAOF
-    if (cmd == "SAVE") {
-        auto snap = cache.get_all_items(now);
-        if (rdb_save_snapshot(Config::rdb_file, snap)) {
-            last_save_time.store(now / 1000);
-            return "+OK\r\n";
-        }
-        return "-ERR RDB save failed\r\n";
-    }
-
-    if (cmd == "BGSAVE") {
-        if (rdb_save_in_progress.load())
-            return "+Background save already in progress\r\n";
-        auto snap = cache.get_all_items(now);
-        rdb_save_in_progress.store(true);
-        std::thread([this, snap = std::move(snap)]() {
-            std::string tmp = Config::rdb_file + ".bgsave.tmp";
-            if (rdb_save_snapshot(tmp, snap)) {
-                std::unique_lock<std::shared_mutex> lk(mtx);
-                std::rename(tmp.c_str(), Config::rdb_file.c_str());
-                last_save_time.store(get_current_time_ms() / 1000);
-                Logger::info("BGSAVE complete.");
-            } else { Logger::error("BGSAVE failed."); }
-            rdb_save_in_progress.store(false);
-        }).detach();
-        return "+Background saving started\r\n";
-    }
-
-    if (cmd == "LASTSAVE")
-        return ":"+std::to_string(last_save_time.load())+"\r\n";
-
-    if (cmd == "BGREWRITEAOF") {
-        if (rewrite_in_progress.load())
-            return "+Background AOF rewrite already in progress\r\n";
-        auto snap = cache.get_all_items(now);
-        rewrite_in_progress.store(true);
-        std::thread([this, snap = std::move(snap)]() {
-            std::string tmp = Config::aof_file + ".rewrite.tmp";
-            { std::ofstream f(tmp, std::ios::trunc);
-              if (!f.is_open()) { Logger::error("BGREWRITEAOF: cannot open tmp"); rewrite_in_progress.store(false); return; }
-              for (const auto& item : snap) f << serialize_item_to_resp(item);
-              f.flush(); }
-            { std::unique_lock<std::shared_mutex> lk(mtx);
-              if (aof_file.is_open()) aof_file.close();
-              std::rename(tmp.c_str(), Config::aof_file.c_str());
-              aof_file.open(Config::aof_file, std::ios::app | std::ios::out); }
-            rewrite_in_progress.store(false);
-            Logger::info("BGREWRITEAOF complete.");
-        }).detach();
-        return "+Background append only file rewriting started\r\n";
-    }
-
-    // ---------------------------------------- CONFIG
-    if (cmd == "CONFIG" && args.size() >= 3) {
-        std::string sub = args[1];
-        for (char& c : sub) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-        if (sub == "GET") {
-            std::string p = args[2];
-            for (char& c : p) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-            std::vector<std::pair<std::string,std::string>> m;
-            auto add = [&](const std::string& k, const std::string& v) {
-                if (fnmatch(p.c_str(), k.c_str(), 0) == 0) m.push_back({k,v});
-            };
-            add("port",              std::to_string(Config::port));
-            add("maxmemory",         std::to_string(Config::max_memory));
-            add("aof_file",          Config::aof_file);
-            add("rdb_file",          Config::rdb_file);
-            add("requirepass",       Config::requirepass);
-            add("slowlog-threshold", std::to_string(Config::slowlog_threshold));
-            add("slowlog-max-len",   std::to_string(Config::slowlog_max_len));
-            add("rdb_save_seconds",  std::to_string(Config::rdb_save_seconds));
-            std::string r = "*"+std::to_string(m.size()*2)+"\r\n";
-            for (const auto& [k,v] : m)
-                r += "$"+std::to_string(k.size())+"\r\n"+k+"\r\n"
-                   + "$"+std::to_string(v.size())+"\r\n"+v+"\r\n";
-            return r;
-        }
-        if (sub == "SET" && args.size() >= 4) {
-            std::string p = args[2], v = args[3];
-            for (char& c : p) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-            if      (p == "maxmemory")         Config::max_memory        = std::stoull(v);
-            else if (p == "requirepass")       Config::requirepass       = v;
-            else if (p == "slowlog-threshold") Config::slowlog_threshold = std::stoi(v);
-            else if (p == "slowlog-max-len")   Config::slowlog_max_len   = std::stoi(v);
-            else if (p == "rdb_save_seconds")  Config::rdb_save_seconds  = std::stoi(v);
-            else return "-ERR Unknown config parameter\r\n";
-            return "+OK\r\n";
-        }
-        if (sub == "RESETSTAT") { total_commands.store(0); return "+OK\r\n"; }
-    }
-
-    // ---------------------------------------- SLOWLOG
-    if (cmd == "SLOWLOG" && args.size() >= 2) {
-        std::string sub = args[1];
-        for (char& c : sub) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-        std::lock_guard<std::mutex> lk(slowlog_mtx);
-        if (sub == "LEN")   return ":"+std::to_string(slowlog.size())+"\r\n";
-        if (sub == "RESET") { slowlog.clear(); return "+OK\r\n"; }
-        if (sub == "GET") {
-            size_t cnt = 128;
-            if (args.size() >= 3) try { cnt = std::stoull(args[2]); } catch (...) {}
-            cnt = std::min(cnt, slowlog.size());
-            std::string r = "*"+std::to_string(cnt)+"\r\n";
-            for (size_t i = 0; i < cnt; ++i) {
-                const auto& e = slowlog[i];
-                r += "*4\r\n:"+std::to_string(e.id)+"\r\n:"+std::to_string(e.timestamp_ms)+
-                     "\r\n:"+std::to_string(e.duration_ms)+"\r\n";
-                r += "*"+std::to_string(e.args.size())+"\r\n";
-                for (const auto& a : e.args) r += "$"+std::to_string(a.size())+"\r\n"+a+"\r\n";
-            }
-            return r;
-        }
-    }
-
-    // ---------------------------------------- DBSIZE / FLUSHDB
-    if (cmd == "DBSIZE") return ":"+std::to_string(cache.size())+"\r\n";
-    if (cmd == "FLUSHDB") { cache = LRUCache(Config::max_memory); append_to_aof(args); return "+OK\r\n"; }
-
-    // ---------------------------------------- DEL / EXISTS / TYPE / RENAME
-    if (cmd == "DEL" && args.size() >= 2) {
-        int d = 0;
-        for (size_t i=1;i<args.size();++i) if(cache.remove(args[i]))++d;
-        append_to_aof(args); return ":"+std::to_string(d)+"\r\n";
-    }
-    if (cmd == "EXISTS" && args.size() >= 2) return cache.exists(args[1],now)?":1\r\n":":0\r\n";
-    if (cmd == "TYPE" && args.size() >= 2) {
-        CacheItem* item=cache.get_item(args[1],now);
-        if (!item) return "+none\r\n";
-        if (std::holds_alternative<std::string>(item->value))                                  return "+string\r\n";
-        if (std::holds_alternative<std::list<std::string>>(item->value))                       return "+list\r\n";
-        if (std::holds_alternative<std::unordered_set<std::string>>(item->value))              return "+set\r\n";
-        if (std::holds_alternative<std::unordered_map<std::string,std::string>>(item->value))  return "+hash\r\n";
-        if (std::holds_alternative<ZSet>(item->value)) return "+zset\r\n";
-    }
-    if (cmd == "RENAME" && args.size() >= 3) {
-        CacheItem* item=cache.get_item(args[1],now);
-        if(!item) return "-ERR no such key\r\n";
-        cache.put(args[2],item->value,item->expires_at); cache.remove(args[1]);
-        append_to_aof(args); return "+OK\r\n";
-    }
-
-    // ---------------------------------------- KEYS / SCAN
-    if (cmd == "KEYS" && args.size() >= 2) {
-        auto all = cache.get_all_items(now);
-        std::string r = ""; int cnt = 0;
-        for (const auto& item : all)
-            if (fnmatch(args[1].c_str(), item.key.c_str(), 0) == 0) {
-                r += "$"+std::to_string(item.key.size())+"\r\n"+item.key+"\r\n"; ++cnt;
-            }
-        return "*"+std::to_string(cnt)+"\r\n"+r;
-    }
-    if (cmd == "SCAN" && args.size() >= 2) {
-        size_t cursor=0,count=10; std::string pat="*";
-        try{cursor=std::stoull(args[1]);}catch(...){return"-ERR invalid cursor\r\n";}
-        for (size_t i=2;i+1<args.size();++i) {
-            std::string opt=args[i]; for(char&c:opt)c=toupper(c);
-            if(opt=="COUNT") try{count=std::stoull(args[i+1]);}catch(...){}
-            if(opt=="MATCH") pat=args[i+1];
-        }
-        auto [next,keys]=cache.scan(cursor,count,now);
-        std::vector<std::string> filtered;
-        for(const auto& k:keys) if(fnmatch(pat.c_str(),k.c_str(),0)==0) filtered.push_back(k);
-        std::string nc=std::to_string(next);
-        std::string r="*2\r\n$"+std::to_string(nc.size())+"\r\n"+nc+"\r\n";
-        r+="*"+std::to_string(filtered.size())+"\r\n";
-        for(const auto& k:filtered) r+="$"+std::to_string(k.size())+"\r\n"+k+"\r\n";
-        return r;
-    }
-
-    // ---------------------------------------- TTL family
-    if (cmd=="TTL"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return":-2\r\n";if(i->expires_at==0)return":-1\r\n";int64_t s=(i->expires_at-now)/1000;return":"+std::to_string(s>0?s:0)+"\r\n";}
-    if (cmd=="PTTL"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return":-2\r\n";if(i->expires_at==0)return":-1\r\n";int64_t ms=i->expires_at-now;return":"+std::to_string(ms>0?ms:0)+"\r\n";}
-    if (cmd=="EXPIRE"&&args.size()>=3){int64_t s=0;try{s=std::stoll(args[2]);}catch(...){return"-ERR\r\n";}bool ok=cache.set_expiry(args[1],now+s*1000);if(ok)append_to_aof(args);return ok?":1\r\n":":0\r\n";}
-    if (cmd=="PEXPIRE"&&args.size()>=3){int64_t ms=0;try{ms=std::stoll(args[2]);}catch(...){return"-ERR\r\n";}bool ok=cache.set_expiry(args[1],now+ms);if(ok)append_to_aof(args);return ok?":1\r\n":":0\r\n";}
-    if (cmd=="PEXPIREAT"&&args.size()>=3){int64_t a=0;try{a=std::stoll(args[2]);}catch(...){return"-ERR\r\n";}bool ok=cache.set_expiry(args[1],a);if(ok)append_to_aof(args);return ok?":1\r\n":":0\r\n";}
-    if (cmd=="PERSIST"&&args.size()>=2){bool ok=cache.set_expiry(args[1],0);if(ok)append_to_aof(args);return ok?":1\r\n":":0\r\n";}
-
-    // ---------------------------------------- STRING
-    if (cmd=="SET"&&args.size()>=3) {
-        int64_t exp=0;
-        for(size_t i=3;i+1<args.size();++i){
-            std::string f=args[i];for(char&c:f)c=toupper(c);
-            try{if(f=="EX")exp=now+std::stoll(args[i+1])*1000;if(f=="PX")exp=now+std::stoll(args[i+1]);}catch(...){return"-ERR\r\n";}
-        }
-        cache.put(args[1],args[2],exp); append_to_aof(args); return "+OK\r\n";
-    }
-    if (cmd=="GET"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"$-1\r\n";if(auto*s=std::get_if<std::string>(&i->value))return"$"+std::to_string(s->size())+"\r\n"+*s+"\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if (cmd=="APPEND"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);std::string r;if(!i){cache.put(args[1],args[2]);r=args[2];}else{if(auto*s=std::get_if<std::string>(&i->value)){*s+=args[2];r=*s;}else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}append_to_aof(args);return":"+std::to_string(r.size())+"\r\n";}
-    if (cmd=="STRLEN"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*s=std::get_if<std::string>(&i->value))return":"+std::to_string(s->size())+"\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if (cmd=="GETSET"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);std::string old="$-1\r\n";if(i){if(auto*s=std::get_if<std::string>(&i->value))old="$"+std::to_string(s->size())+"\r\n"+*s+"\r\n";else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}cache.put(args[1],args[2]);append_to_aof(args);return old;}
-
-    auto num_op=[&](const std::string&key,int64_t delta)->std::string{
-        CacheItem*i=cache.get_item(key,now);int64_t val=0;
-        if(i){if(auto*s=std::get_if<std::string>(&i->value)){try{val=std::stoll(*s);}catch(...){return"-ERR value not integer\r\n";}}else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-        val+=delta;cache.put(key,std::to_string(val));return":"+std::to_string(val)+"\r\n";
-    };
-    if(cmd=="INCR"  &&args.size()>=2){auto r=num_op(args[1], 1);if(r[0]==':')append_to_aof(args);return r;}
-    if(cmd=="DECR"  &&args.size()>=2){auto r=num_op(args[1],-1);if(r[0]==':')append_to_aof(args);return r;}
-    if(cmd=="INCRBY"&&args.size()>=3){int64_t d=0;try{d=std::stoll(args[2]);}catch(...){return"-ERR\r\n";}auto r=num_op(args[1],d);if(r[0]==':')append_to_aof(args);return r;}
-    if(cmd=="DECRBY"&&args.size()>=3){int64_t d=0;try{d=std::stoll(args[2]);}catch(...){return"-ERR\r\n";}auto r=num_op(args[1],-d);if(r[0]==':')append_to_aof(args);return r;}
-
-    // ---------------------------------------- LIST
-    if((cmd=="LPUSH"||cmd=="RPUSH")&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);int nl=0;if(!i){std::list<std::string>l;for(size_t x=2;x<args.size();++x)cmd=="LPUSH"?l.push_front(args[x]):l.push_back(args[x]);nl=l.size();cache.put(args[1],l);}else{if(auto*l=std::get_if<std::list<std::string>>(&i->value)){for(size_t x=2;x<args.size();++x)cmd=="LPUSH"?l->push_front(args[x]):l->push_back(args[x]);nl=l->size();}else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}append_to_aof(args);return":"+std::to_string(nl)+"\r\n";}
-    if((cmd=="LPOP"||cmd=="RPOP")&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"$-1\r\n";if(auto*l=std::get_if<std::list<std::string>>(&i->value)){if(l->empty())return"$-1\r\n";std::string v=cmd=="LPOP"?l->front():l->back();cmd=="LPOP"?l->pop_front():l->pop_back();append_to_aof(args);return"$"+std::to_string(v.size())+"\r\n"+v+"\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="LLEN"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*l=std::get_if<std::list<std::string>>(&i->value))return":"+std::to_string(l->size())+"\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="LRANGE"&&args.size()>=4){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*l=std::get_if<std::list<std::string>>(&i->value)){int len=l->size(),start=0,stop=0;try{start=std::stoi(args[2]);stop=std::stoi(args[3]);}catch(...){return"-ERR\r\n";}if(start<0)start=std::max(0,len+start);if(stop<0)stop=len+stop;stop=std::min(stop,len-1);if(start>stop||start>=len)return"*0\r\n";std::string r;int cnt=0,idx=0;for(const auto&v:*l){if(idx>stop)break;if(idx>=start){r+="$"+std::to_string(v.size())+"\r\n"+v+"\r\n";++cnt;}++idx;}return"*"+std::to_string(cnt)+"\r\n"+r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-
-    // ---------------------------------------- SET
-    if(cmd=="SADD"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);int a=0;if(!i){std::unordered_set<std::string>s;for(size_t x=2;x<args.size();++x)if(s.insert(args[x]).second)++a;cache.put(args[1],s);}else{if(auto*s=std::get_if<std::unordered_set<std::string>>(&i->value))for(size_t x=2;x<args.size();++x)if(s->insert(args[x]).second)++a;else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}append_to_aof(args);return":"+std::to_string(a)+"\r\n";}
-    if(cmd=="SISMEMBER"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*s=std::get_if<std::unordered_set<std::string>>(&i->value))return s->count(args[2])?":1\r\n":":0\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="SMEMBERS"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*s=std::get_if<std::unordered_set<std::string>>(&i->value)){std::string r="*"+std::to_string(s->size())+"\r\n";for(const auto&m:*s)r+="$"+std::to_string(m.size())+"\r\n"+m+"\r\n";return r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="SREM"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*s=std::get_if<std::unordered_set<std::string>>(&i->value)){int rm=0;for(size_t x=2;x<args.size();++x)rm+=s->erase(args[x]);append_to_aof(args);return":"+std::to_string(rm)+"\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="SCARD"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*s=std::get_if<std::unordered_set<std::string>>(&i->value))return":"+std::to_string(s->size())+"\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-
-    // ---------------------------------------- HASH
-    if(cmd=="HSET"&&args.size()>=4&&(args.size()%2)==0){CacheItem*i=cache.get_item(args[1],now);int a=0;if(!i){std::unordered_map<std::string,std::string>h;for(size_t x=2;x<args.size();x+=2){if(h.find(args[x])==h.end())++a;h[args[x]]=args[x+1];}cache.put(args[1],h);}else{if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){for(size_t x=2;x<args.size();x+=2){if(h->find(args[x])==h->end())++a;(*h)[args[x]]=args[x+1];}}else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}append_to_aof(args);return":"+std::to_string(a)+"\r\n";}
-    if(cmd=="HSETNX"&&args.size()>=4){CacheItem*i=cache.get_item(args[1],now);if(!i){cache.put(args[1],std::unordered_map<std::string,std::string>{{args[2],args[3]}});append_to_aof(args);return":1\r\n";}if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){if(h->count(args[2]))return":0\r\n";(*h)[args[2]]=args[3];append_to_aof(args);return":1\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HGET"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);if(!i)return"$-1\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){auto it=h->find(args[2]);if(it==h->end())return"$-1\r\n";return"$"+std::to_string(it->second.size())+"\r\n"+it->second+"\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HMGET"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);std::string r="*"+std::to_string(args.size()-2)+"\r\n";for(size_t x=2;x<args.size();++x){if(!i){r+="$-1\r\n";continue;}if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){auto it=h->find(args[x]);if(it==h->end())r+="$-1\r\n";else r+="$"+std::to_string(it->second.size())+"\r\n"+it->second+"\r\n";}else return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}return r;}
-    if(cmd=="HDEL"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){int rm=0;for(size_t x=2;x<args.size();++x)rm+=h->erase(args[x]);append_to_aof(args);return":"+std::to_string(rm)+"\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HEXISTS"&&args.size()>=3){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value))return h->count(args[2])?":1\r\n":":0\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HLEN"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return":0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value))return":"+std::to_string(h->size())+"\r\n";return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HKEYS"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){std::string r="*"+std::to_string(h->size())+"\r\n";for(const auto&[k,v]:*h)r+="$"+std::to_string(k.size())+"\r\n"+k+"\r\n";return r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HVALS"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){std::string r="*"+std::to_string(h->size())+"\r\n";for(const auto&[k,v]:*h)r+="$"+std::to_string(v.size())+"\r\n"+v+"\r\n";return r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HGETALL"&&args.size()>=2){CacheItem*i=cache.get_item(args[1],now);if(!i)return"*0\r\n";if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){std::string r="*"+std::to_string(h->size()*2)+"\r\n";for(const auto&[k,v]:*h){r+="$"+std::to_string(k.size())+"\r\n"+k+"\r\n$"+std::to_string(v.size())+"\r\n"+v+"\r\n";}return r;}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    if(cmd=="HINCRBY"&&args.size()>=4){int64_t d=0;try{d=std::stoll(args[3]);}catch(...){return"-ERR\r\n";}CacheItem*i=cache.get_item(args[1],now);int64_t val=0;if(!i){cache.put(args[1],std::unordered_map<std::string,std::string>{{args[2],std::to_string(d)}});append_to_aof(args);return":"+std::to_string(d)+"\r\n";}if(auto*h=std::get_if<std::unordered_map<std::string,std::string>>(&i->value)){auto it=h->find(args[2]);if(it!=h->end())try{val=std::stoll(it->second);}catch(...){return"-ERR hash value not integer\r\n";}val+=d;(*h)[args[2]]=std::to_string(val);append_to_aof(args);return":"+std::to_string(val)+"\r\n";}return"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";}
-    // ================================================================
-    // SORTED SET commands
-    // ================================================================
-
-    if (cmd == "ZADD" && args.size() >= 4 && (args.size() % 2) == 0) {
-        CacheItem* item = cache.get_item(args[1], now);
-        int added = 0;
-
-        if (!item) {
-            ZSet z;
-            for (size_t i = 2; i < args.size(); i += 2) {
-                double score = 0;
-                try { score = std::stod(args[i]); }
-                catch (...) { return "-ERR value is not a valid float\r\n"; }
-                z.dict[args[i+1]] = score;
-                z.tree.insert({score, args[i+1]});
-                added++;
-            }
-            cache.put(args[1], z);
-        } else {
-            if (auto* z = std::get_if<ZSet>(&item->value)) {
-                for (size_t i = 2; i < args.size(); i += 2) {
-                    double score = 0;
-                    try { score = std::stod(args[i]); }
-                    catch (...) { return "-ERR value is not a valid float\r\n"; }
-
-                    auto it = z->dict.find(args[i+1]);
-                    if (it != z->dict.end()) {
-                        if (it->second != score) {
-                            z->tree.erase({it->second, args[i+1]}); // O(log N)
-                            z->tree.insert({score, args[i+1]});     // O(log N)
-                            it->second = score;
-                        }
-                    } else {
-                        z->dict[args[i+1]] = score;
-                        z->tree.insert({score, args[i+1]});
-                        added++;
-                    }
-                }
-            } else return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
-        }
-        append_to_aof(args);
-        return ":" + std::to_string(added) + "\r\n";
-    }
-
-    if (cmd == "ZRANGE" && args.size() >= 4) {
-        CacheItem* item = cache.get_item(args[1], now);
-        if (!item) return "*0\r\n";
-
-        if (auto* z = std::get_if<ZSet>(&item->value)) {
-            int len = z->tree.size();
-            int start = 0, stop = 0;
-            try { start = std::stoi(args[2]); stop = std::stoi(args[3]); }
-            catch (...) { return "-ERR value is not an integer or out of range\r\n"; }
-
-            bool withscores = false;
-            if (args.size() >= 5) {
-                std::string opt = args[4];
-                for (char& c : opt) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
-                if (opt == "WITHSCORES") withscores = true;
-            }
-
-            if (start < 0) start = std::max(0, len + start);
-            if (stop < 0) stop = len + stop;
-            stop = std::min(stop, len - 1);
-
-            if (start > stop || start >= len) return "*0\r\n";
-
-            int count = 0;
-            std::string resp = "";
-            auto it = z->tree.begin();
-            std::advance(it, start); 
-
-            for (int i = start; i <= stop && it != z->tree.end(); ++i, ++it) {
-                resp += "$" + std::to_string(it->second.size()) + "\r\n" + it->second + "\r\n";
-                count++;
-                if (withscores) {
-                    std::ostringstream oss;
-                    oss << it->first; 
-                    std::string s_str = oss.str();
-                    resp += "$" + std::to_string(s_str.size()) + "\r\n" + s_str + "\r\n";
-                    count++;
-                }
-            }
-            return "*" + std::to_string(count) + "\r\n" + resp;
-        }
-        return "-WRONGTYPE Operation against a key holding the wrong kind of value\r\n";
-    }
-
-    return "-ERR Unknown command '"+args[0]+"'\r\n";
+    return "-ERR Unknown command '" + args[0] + "'\r\n";
 }
 
 // NEW: Helper to identify which keys were modified so we can bump their version
-void KeyValueStore::bump_versions(const std::vector<std::string>& args) {
+void KeyValueStore::track_mutations(const std::vector<std::string>& args) {
     if (args.empty()) return;
     std::string cmd = args[0];
     for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
@@ -782,14 +461,15 @@ void KeyValueStore::bump_versions(const std::vector<std::string>& args) {
     if (!write_cmds.count(cmd)) return;
 
     if (cmd == "FLUSHDB") {
-        global_flush_version++; // Automatically breaks ALL active watches
+        global_flush_version++; 
     } else if (cmd == "DEL") {
         for (size_t i = 1; i < args.size(); ++i) key_versions[args[i]]++;
     } else if (cmd == "RENAME" && args.size() >= 3) {
-        key_versions[args[1]]++;
-        key_versions[args[2]]++;
+        key_versions[args[1]]++; cache.recalculate_size(args[1]);
+        key_versions[args[2]]++; cache.recalculate_size(args[2]);
     } else if (args.size() > 1) {
-        key_versions[args[1]]++; // 95% of commands map the key to args[1]
+        key_versions[args[1]]++; 
+        cache.recalculate_size(args[1]); // NEW: Update the memory footprint!
     }
 }
 
@@ -868,7 +548,7 @@ std::string KeyValueStore::execute_command(const std::vector<std::string>& args,
         for (const auto& qa : tx.queue) {
             std::string res = execute_command_locked(qa);
             r += res;
-            if (res[0] != '-') bump_versions(qa); // Increment version on success
+            if (res[0] != '-') track_mutations(qa); // Increment version on success
         }
         
         tx.active = false; tx.queue.clear(); tx.watched_keys.clear(); return r;
@@ -895,7 +575,7 @@ std::string KeyValueStore::execute_command(const std::vector<std::string>& args,
     } else { 
         std::unique_lock<std::shared_mutex> lk(mtx); 
         result = execute_command_locked(args); 
-        if (result[0] != '-') bump_versions(args); // Increment version on success
+        if (result[0] != '-') track_mutations(args); // Increment version on success
     }
     
     record_slowlog(args, get_current_time_ms() - t0);

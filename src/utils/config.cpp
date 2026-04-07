@@ -29,7 +29,7 @@ void Config::load(const std::string& filename) {
         v.erase(std::remove_if(v.begin(), v.end(), ::isspace), v.end());
         if      (k == "port")              Config::port              = std::stoi(v);
         else if (k == "leader_port")       Config::leader_port       = std::stoi(v);
-        else if (k == "max_memory")        Config::max_memory        = std::stoull(v);
+        else if (k == "max_memory")        Config::max_memory        = std::stoull(v) * 1024 * 1024;
         else if (k == "aof_file")          Config::aof_file          = v;
         else if (k == "rdb_file")          Config::rdb_file          = v;
         else if (k == "requirepass")       Config::requirepass       = v;

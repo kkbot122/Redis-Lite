@@ -25,31 +25,35 @@ using RedisValue = std::variant<
 struct CacheItem {
     std::string key;
     RedisValue  value;
-    int64_t     expires_at;   // ms epoch; 0 = no expiry
+    int64_t     expires_at;
+    size_t      mem_size = 0;
 };
 
 class LRUCache {
 private:
-    size_t capacity;
+    size_t max_memory_bytes;
+    size_t current_memory_bytes = 0; // NEW: Global memory tracker
+
     std::list<CacheItem> items;
     std::unordered_map<std::string, std::list<CacheItem>::iterator> map;
 
-    void evict_if_needed();
+    void   evict_if_needed();
+    size_t calculate_item_size(const std::string& key, const RedisValue& value) const;
 
 public:
-    explicit LRUCache(size_t cap);
+    explicit LRUCache(size_t max_bytes);
 
-    void      put       (const std::string& key, const RedisValue& value, int64_t expires_at = 0);
-    CacheItem* get_item (const std::string& key, int64_t current_time_ms);
-    bool      exists    (const std::string& key, int64_t current_time_ms);
-    bool      remove    (const std::string& key);
-    bool      set_expiry(const std::string& key, int64_t expires_at);
-    size_t    size      () const;
+    void       put       (const std::string& key, const RedisValue& value, int64_t expires_at = 0);
+    CacheItem* get_item  (const std::string& key, int64_t current_time_ms);
+    bool       exists    (const std::string& key, int64_t current_time_ms);
+    bool       remove    (const std::string& key);
+    bool       set_expiry(const std::string& key, int64_t expires_at);
+    size_t     size      () const;
+    size_t     memory_usage() const; // For the INFO command
 
-    // Full snapshot for BGREWRITEAOF — returns a copy of every live item.
+    // NEW: Recalculates size when a value is modified in-place (e.g., ZADD, HSET)
+    void       recalculate_size(const std::string& key);
+
     std::vector<CacheItem> get_all_items(int64_t current_time_ms) const;
-
-    // Cursor-based SCAN. cursor=0 starts over; next_cursor=0 means done.
-    std::pair<size_t, std::vector<std::string>> scan(
-        size_t cursor, size_t count, int64_t current_time_ms) const;
+    std::pair<size_t, std::vector<std::string>> scan(size_t cursor, size_t count, int64_t current_time_ms) const;
 };

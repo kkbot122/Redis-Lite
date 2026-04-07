@@ -7,7 +7,8 @@
 #include <shared_mutex>
 #include <mutex>
 #include <atomic>
-#include <cstdint>
+#include <unordered_map>
+#include <functional> // NEW: For our Command Handlers!
 
 struct SlowlogEntry {
     int64_t                  id;
@@ -17,10 +18,10 @@ struct SlowlogEntry {
 };
 
 struct TxState {
-    bool                                  active  = false;
-    bool                                  errored = false;
-    std::vector<std::vector<std::string>> queue;
-    std::unordered_map<std::string, uint64_t> watched_keys;
+    bool                                      active  = false;
+    bool                                      errored = false;
+    std::vector<std::vector<std::string>>     queue;
+    std::unordered_map<std::string, uint64_t> watched_keys; 
 };
 
 class KeyValueStore {
@@ -31,10 +32,9 @@ private:
 
     mutable std::shared_mutex mtx;
 
-    // NEW: Key modification tracking for WATCH
     std::unordered_map<std::string, uint64_t> key_versions; 
     std::atomic<uint64_t>                     global_flush_version{0};
-    void bump_versions(const std::vector<std::string>& args);
+    void track_mutations(const std::vector<std::string>& args); 
 
     int64_t              start_time_ms;
     std::atomic<int64_t> total_commands{0};
@@ -45,6 +45,14 @@ private:
     mutable std::mutex       slowlog_mtx;
     std::deque<SlowlogEntry> slowlog;
     std::atomic<int64_t>     slowlog_id{0};
+
+    // =======================================================
+    // NEW: The Command Registry
+    // =======================================================
+    using CommandHandler = std::function<std::string(const std::vector<std::string>&, int64_t)>;
+    std::unordered_map<std::string, CommandHandler> command_registry;
+    void init_commands(); // Registers all functions on boot
+    // =======================================================
 
     int64_t     get_current_time_ms() const;
     void        append_to_aof(const std::vector<std::string>& args);
@@ -63,9 +71,7 @@ public:
     ~KeyValueStore();
 
     std::string execute_command(const std::vector<std::string>& args,
-                                TxState& tx,
-                                bool& authenticated);
-
-    // Called by the server's auto-save timer.
-    void maybe_auto_save();
+                                TxState& tx, bool& authenticated);
+    
+    void        maybe_auto_save();
 };
