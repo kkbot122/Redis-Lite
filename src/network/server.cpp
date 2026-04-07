@@ -136,22 +136,17 @@ void RedisServer::replicate(const std::vector<std::string>& args) {
 // ============================================================
 
 void RedisServer::send_full_resync(int replica_fd) {
-    // Tell the replica to expect a full resync.
     std::string header = "+FULLRESYNC " + repl_id + " " +
                          std::to_string(repl_offset.load()) + "\r\n";
     send(replica_fd, header.c_str(), header.size(), 0);
 
-    // Trigger a blocking SAVE so we have a fresh RDB on disk.
-    // In production this should fork() to avoid blocking, but for our
-    // single-process model a synchronous save is acceptable.
     std::ifstream rdb(Config::rdb_file, std::ios::binary | std::ios::ate);
     if (!rdb.is_open()) {
-        // No RDB yet — send an empty RDB (minimal valid header + EOF).
         const unsigned char empty_rdb[] = {
             0x52,0x45,0x44,0x49,0x53,  // "REDIS"
             0x30,0x30,0x31,0x31,       // "0011"
-            0xFF,                       // EOF
-            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00  // 8-byte CRC (zeroed)
+            0xFF,                      // EOF
+            0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00  // 8-byte CRC
         };
         std::string preamble = "$" + std::to_string(sizeof(empty_rdb)) + "\r\n";
         send(replica_fd, preamble.c_str(), preamble.size(), 0);
@@ -180,25 +175,22 @@ bool RedisServer::handle_replication_handshake(int fd,
     std::string cmd = args[0];
     for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
-    // REPLCONF listening-port <port>  /  REPLCONF capa eof  /  REPLCONF ACK <offset>
     if (cmd == "REPLCONF") {
         if (args.size() >= 3) {
             std::string sub = args[1];
             for (char& c : sub) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
             if (sub == "ACK") {
-                // Replica is confirming it has processed up to this offset.
                 try {
                     int64_t replica_offset = std::stoll(args[2]);
                     clients[fd].repl_offset = replica_offset;
                 } catch (...) {}
-                return true;   // ACK — no response needed.
+                return true; 
             }
         }
         send(fd, "+OK\r\n", 5, 0);
         return true;
     }
 
-    // PSYNC <repl_id> <offset>
     if (cmd == "PSYNC" && args.size() >= 3) {
         const std::string& peer_id     = args[1];
         int64_t            peer_offset = -1;
@@ -206,14 +198,12 @@ bool RedisServer::handle_replication_handshake(int fd,
 
         bool can_partial = false;
         if (peer_id == repl_id && peer_offset >= 0) {
-            // Check whether the requested offset is still in our backlog.
             std::lock_guard<std::mutex> lk(backlog_mtx);
             int64_t backlog_start = repl_offset.load() -
                                     static_cast<int64_t>(repl_backlog.size());
             can_partial = (peer_offset >= backlog_start);
 
             if (can_partial) {
-                // Partial resync — send only the missing bytes.
                 std::string cont = "+CONTINUE " + repl_id + "\r\n";
                 send(fd, cont.c_str(), cont.size(), 0);
 
@@ -228,7 +218,6 @@ bool RedisServer::handle_replication_handshake(int fd,
             }
         }
 
-        // Full resync.
         send_full_resync(fd);
         replica_fds.push_back(fd);
         Logger::info("Full resync with replica fd=" + std::to_string(fd));
@@ -295,6 +284,7 @@ bool RedisServer::handle_pubsub(int fd, const std::vector<std::string>& args) {
 // ============================================================
 
 void RedisServer::close_client(int fd) {
+    // Clean up Pub/Sub
     {
         std::lock_guard<std::mutex> lk(pubsub_mtx);
         auto it = clients.find(fd);
@@ -304,6 +294,15 @@ void RedisServer::close_client(int fd) {
                 if (pubsub_channels[ch].empty()) pubsub_channels.erase(ch);
             }
     }
+    
+    // Clean up Async BLPOP Waiting Room
+    if (client_blocked_on.count(fd)) {
+        for (const auto& key : client_blocked_on[fd]) {
+            waiting_clients[key].remove(fd);
+        }
+        client_blocked_on.erase(fd);
+    }
+
     clients.erase(fd);
     replica_fds.erase(std::remove(replica_fds.begin(), replica_fds.end(), fd), replica_fds.end());
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
@@ -390,7 +389,6 @@ void RedisServer::run() {
             epoll_add(leader_fd);
             clients[leader_fd].authenticated = true;
 
-            // Handshake: REPLCONF listening-port, then PSYNC
             auto send_resp = [&](const std::vector<std::string>& a) {
                 std::string s = "*"+std::to_string(a.size())+"\r\n";
                 for (const auto& x : a) s += "$"+std::to_string(x.size())+"\r\n"+x+"\r\n";
@@ -398,7 +396,6 @@ void RedisServer::run() {
             };
             send_resp({"REPLCONF", "listening-port", std::to_string(port)});
             send_resp({"REPLCONF", "capa", "eof"});
-            // Request partial sync from offset 0 with no known ID.
             send_resp({"PSYNC", "?", "-1"});
         } else {
             Logger::error("Failed to connect to leader on port " + std::to_string(leader_port));
@@ -418,7 +415,7 @@ void RedisServer::run() {
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             if (fd == server_fd || fd == unix_fd) handle_new_connection(fd);
-            else                                   handle_client_data(fd);
+            else                                  handle_client_data(fd);
         }
     }
 
@@ -484,20 +481,15 @@ void RedisServer::handle_client_data(int fd) {
         std::string cmd = args[0];
         for (char& c : cmd) c = static_cast<char>(toupper(static_cast<unsigned char>(c)));
 
-        // REPLCONF / PSYNC from a replica connecting to us as leader
         if ((cmd == "REPLCONF" || cmd == "PSYNC") && leader_port == 0) {
             handle_replication_handshake(fd, args);
             continue;
         }
 
-        // FULLRESYNC / RDB preamble from leader to us as replica — handled implicitly
-        // via the binary data flow; nothing to dispatch here.
         if (fd == leader_fd && cmd == "PING") {
-            // Leader keepalive — just update the heartbeat (already done above).
             continue;
         }
 
-        // Pub/Sub commands
         if (cmd == "SUBSCRIBE" || cmd == "UNSUBSCRIBE" || cmd == "PUBLISH") {
             handle_pubsub(fd, args);
             continue;
@@ -505,8 +497,46 @@ void RedisServer::handle_client_data(int fd) {
 
         std::string response = store.execute_command(args, state.tx, state.authenticated);
 
-        if (fd != leader_fd)
+        // ============================================================
+        // ASYNC WAKE-UP WIDGET (BLPOP INTERCEPTOR)
+        // ============================================================
+        if (response == "*WAIT\r\n") {
+            for (size_t i = 1; i < args.size() - 1; ++i) {
+                waiting_clients[args[i]].push_back(fd);
+                client_blocked_on[fd].push_back(args[i]);
+            }
+            continue; // Stop processing and don't send a response. Let them sleep!
+        }
+
+        if (fd != leader_fd) {
             send(fd, response.c_str(), response.size(), 0);
+        }
+
+        // ============================================================
+        // ASYNC WAKE-UP WIDGET (LPUSH TRIGGER)
+        // ============================================================
+        if (cmd == "LPUSH" || cmd == "RPUSH") {
+            std::string list_key = args[1];
+            if (waiting_clients.count(list_key) && !waiting_clients[list_key].empty()) {
+                
+                // Pop the oldest sleeping client for this queue
+                int parked_fd = waiting_clients[list_key].front();
+                waiting_clients[list_key].pop_front();
+                
+                // Clear their sleep status
+                if (client_blocked_on.count(parked_fd)) {
+                    client_blocked_on.erase(parked_fd);
+                }
+
+                // Internally fire the BLPOP command on their behalf to grab the fresh data
+                TxState dummy_tx; bool dummy_auth = true;
+                std::vector<std::string> wake_args = {"BLPOP", list_key, "0"};
+                std::string wake_response = store.execute_command(wake_args, dummy_tx, dummy_auth);
+
+                // Shoot the data to the woken client!
+                send(parked_fd, wake_response.c_str(), wake_response.size(), 0);
+            }
+        }
 
         // Replicate successful writes
         if (leader_port == 0 && WRITE_COMMANDS.count(cmd) && response[0] != '-')
@@ -522,7 +552,6 @@ void RedisServer::check_heartbeats() {
     int64_t now = get_time_ms();
 
     if (leader_port == 0 && now - last_ping_time > 2000) {
-        // Send PING + ask each replica for its offset via REPLCONF GETACK
         const std::string ping = "*1\r\n$4\r\nPING\r\n";
         const std::string ack  = "*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n";
         for (int rep_fd : replica_fds) {
@@ -536,7 +565,7 @@ void RedisServer::check_heartbeats() {
         Logger::error("Leader silent — promoting self to leader.");
         close_client(leader_fd);
         leader_fd = -1; leader_port = 0;
-        repl_id = generate_repl_id();   // New ID after promotion.
+        repl_id = generate_repl_id();  
         Logger::info("Promoted to leader. New repl_id=" + repl_id);
     }
 }

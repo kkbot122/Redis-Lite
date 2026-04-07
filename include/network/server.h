@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
+#include <list>
 #include <deque>
 #include <mutex>
 #include <atomic>
@@ -42,6 +43,12 @@ private:
     // Replication
     std::string          repl_id;           // 40-char hex ID, generated at startup
     std::atomic<int64_t> repl_offset{0};    // bytes sent to all replicas (leader only)
+
+    // Maps a list key to a queue of waiting client sockets
+    std::unordered_map<std::string, std::list<int>> waiting_clients;
+    
+    // Maps a client socket to the keys they are waiting for (for cleanup on disconnect)
+    std::unordered_map<int, std::vector<std::string>> client_blocked_on;
 
     // Replication backlog for PSYNC partial resync.
     // Ring buffer: newest bytes at the front.

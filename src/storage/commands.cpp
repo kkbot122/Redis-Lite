@@ -418,4 +418,28 @@ void KeyValueStore::init_commands() {
         }
         return std::string("-WRONGTYPE\r\n");
     };
+
+    command_registry["BLPOP"] = [this](const std::vector<std::string>& args, int64_t now) {
+        if (args.size() < 3) return std::string("-ERR wrong number of arguments\r\n");
+        
+        // Loop through the provided keys to see if any have data
+        for (size_t i = 1; i < args.size() - 1; ++i) {
+            CacheItem* item = cache.get_item(args[i], now);
+            if (item) {
+                if (auto* l = std::get_if<std::list<std::string>>(&item->value)) {
+                    if (!l->empty()) {
+                        std::string v = l->front();
+                        l->pop_front();
+                        append_to_aof({"LPOP", args[i]});
+                        
+                        // Returns the RESP Array: [key_name, popped_value]
+                        return "*2\r\n$" + std::to_string(args[i].size()) + "\r\n" + args[i] + 
+                               "\r\n$" + std::to_string(v.size()) + "\r\n" + v + "\r\n";
+                    }
+                } else return std::string("-WRONGTYPE Operation against a key holding the wrong kind of value\r\n");
+            }
+        }
+        // If all lists are empty, return the secret internal wait flag
+        return std::string("*WAIT\r\n"); 
+    };
 }
