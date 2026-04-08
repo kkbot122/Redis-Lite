@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <thread>
 #include <fnmatch.h>
+#include <unistd.h>
 
 void KeyValueStore::init_commands() {
 
@@ -45,20 +46,25 @@ void KeyValueStore::init_commands() {
     };
 
     command_registry["BGSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
-        if (rdb_save_in_progress.load()) return std::string("+Background save already in progress\r\n");
-        auto snap = cache.get_all_items(now);
+        if (rdb_save_in_progress.load() || rdb_child_pid != -1) return std::string("+Background save already in progress\r\n");
         rdb_save_in_progress.store(true);
-        std::thread([this, snap = std::move(snap)]() {
+        
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child
+            auto snap = cache.get_all_items(now);
             std::string tmp = Config::rdb_file + ".bgsave.tmp";
-            if (rdb_save_snapshot(tmp, snap)) {
-                std::unique_lock<std::shared_mutex> lk(mtx);
-                std::rename(tmp.c_str(), Config::rdb_file.c_str());
-                last_save_time.store(get_current_time_ms() / 1000);
-                Logger::info("BGSAVE complete.");
-            } else { Logger::error("BGSAVE failed."); }
+            rdb_save_snapshot(tmp, snap);
+            _exit(0); 
+            return std::string(""); // Dummy return to satisfy the compiler
+        } else if (pid > 0) {
+            // Parent
+            rdb_child_pid = pid;
+            return std::string("+Background saving started\r\n");
+        } else {
             rdb_save_in_progress.store(false);
-        }).detach();
-        return std::string("+Background saving started\r\n");
+            return std::string("-ERR fork failed\r\n");
+        }
     };
 
     command_registry["LASTSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
@@ -66,27 +72,32 @@ void KeyValueStore::init_commands() {
     };
 
     command_registry["BGREWRITEAOF"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
-        if (rewrite_in_progress.load()) return std::string("+Background AOF rewrite already in progress\r\n");
-        auto snap = cache.get_all_items(now);
+        if (rewrite_in_progress.load() || aof_child_pid != -1) return std::string("+Background AOF rewrite already in progress\r\n");
         rewrite_in_progress.store(true);
-        std::thread([this, snap = std::move(snap)]() {
+        
+        // Clear the buffer so we can start catching new incoming commands
+        aof_rewrite_buffer.clear();
+        
+        pid_t pid = fork();
+        if (pid == 0) {
+            // Child
+            auto snap = cache.get_all_items(now);
             std::string tmp = Config::aof_file + ".rewrite.tmp";
-            { 
-                std::ofstream f(tmp, std::ios::trunc);
-                if (!f.is_open()) { Logger::error("BGREWRITEAOF: cannot open tmp"); rewrite_in_progress.store(false); return; }
+            std::ofstream f(tmp, std::ios::trunc);
+            if (f.is_open()) {
                 for (const auto& item : snap) f << serialize_item_to_resp(item);
-                f.flush(); 
+                f.flush();
             }
-            { 
-                std::unique_lock<std::shared_mutex> lk(mtx);
-                if (aof_file.is_open()) aof_file.close();
-                std::rename(tmp.c_str(), Config::aof_file.c_str());
-                aof_file.open(Config::aof_file, std::ios::app | std::ios::out); 
-            }
+            _exit(0);
+            return std::string(""); // Dummy return to satisfy the compiler
+        } else if (pid > 0) {
+            // Parent
+            aof_child_pid = pid;
+            return std::string("+Background append only file rewriting started\r\n");
+        } else {
             rewrite_in_progress.store(false);
-            Logger::info("BGREWRITEAOF complete.");
-        }).detach();
-        return std::string("+Background append only file rewriting started\r\n");
+            return std::string("-ERR fork failed\r\n");
+        }
     };
 
     // ==========================================================

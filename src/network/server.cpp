@@ -354,13 +354,14 @@ void RedisServer::run() {
         }
     }
 
-    //start_heartbeat_thread();
+    start_heartbeat_thread();
 
     struct epoll_event events[64];
     while (!g_shutdown.load()) {
         int n = epoll_wait(epoll_fd, events, 64, 1000);
         check_heartbeats();
         store.maybe_auto_save();
+        store.check_background_tasks();
         for (int i = 0; i < n; ++i) {
             int fd = events[i].data.fd;
             if (fd == server_fd || fd == unix_fd) handle_new_connection(fd);
@@ -424,8 +425,10 @@ void RedisServer::handle_client_data(int fd) {
                 if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) break;
                 // NEW: OpenSSL sometimes throws SYSCALL when the OS returns EAGAIN. Ignore it!
                 if (err == SSL_ERROR_SYSCALL && (errno == EAGAIN || errno == EWOULDBLOCK)) break;
+                if (err == SSL_ERROR_SYSCALL && errno == EINTR) continue;
             } else {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+                if (errno == EINTR) continue;
             }
             close_client(fd); return;
         }

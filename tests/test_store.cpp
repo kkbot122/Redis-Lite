@@ -7,7 +7,7 @@
 class StoreTest : public ::testing::Test {
 protected:
 void SetUp() override {
-Config::max_memory = 10;
+Config::max_memory = 1024 * 1024;
 Config::aof_file = "test_database.aof";
 std::remove("test_database.aof");
 }

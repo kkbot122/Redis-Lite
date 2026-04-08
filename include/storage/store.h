@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <functional> 
 #include <lua.hpp>
+#include <sys/types.h>
 
 extern "C" {
     #include <lua.h>
@@ -76,11 +77,16 @@ private:
                                   const std::vector<CacheItem>& items) const;
     bool        rdb_load_snapshot(const std::string& path);
 
+    pid_t rdb_child_pid = -1;
+    pid_t aof_child_pid = -1;
+    std::vector<std::vector<std::string>> aof_rewrite_buffer;
+
 public:
     KeyValueStore();
     ~KeyValueStore();
 
     static bool is_write_command(const std::string& cmd);
+    void check_background_tasks();
 
     std::string execute_command(const std::vector<std::string>& args,
                                 TxState& tx, bool& authenticated, int resp_version=2);

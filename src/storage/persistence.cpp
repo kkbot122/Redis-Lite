@@ -6,6 +6,8 @@
 #include <thread>
 #include <cstdio>
 #include <cstring>
+#include <unistd.h>    
+#include <sys/wait.h>
 
 // ============================================================
 // RDB binary format
@@ -50,6 +52,10 @@ void KeyValueStore::append_to_aof(const std::vector<std::string>& args) {
     for (const auto& a : args)
         aof_file << "$" << a.size() << "\r\n" << a << "\r\n";
     aof_file.flush();
+
+    if (aof_child_pid != -1) {
+        aof_rewrite_buffer.push_back(args);
+    }
 }
 
 void KeyValueStore::load_from_aof() {
@@ -235,27 +241,71 @@ done:
 
 void KeyValueStore::maybe_auto_save() {
     if (Config::rdb_save_seconds <= 0) return;
-    if (rdb_save_in_progress.load()) return;
+    if (rdb_save_in_progress.load() || rdb_child_pid != -1) return;
     int64_t now_s = get_current_time_ms() / 1000;
     if (now_s - last_save_time.load() < Config::rdb_save_seconds) return;
 
-    std::vector<CacheItem> snapshot;
-    {
-        std::unique_lock<std::shared_mutex> lk(mtx);
-        snapshot = cache.get_all_items(get_current_time_ms());
+    rdb_save_in_progress.store(true);
+    
+    // OS MAGIC: Fork the process!
+    pid_t pid = fork();
+    if (pid == 0) {
+        // CHILD PROCESS: We now have a perfectly frozen, zero-cost clone of RAM.
+        // We do NOT need to lock the mutex!
+        auto snap = cache.get_all_items(get_current_time_ms());
+        std::string tmp = Config::rdb_file + ".bgsave.tmp";
+        rdb_save_snapshot(tmp, snap);
+        _exit(0); // Self-destruct silently
+    } else if (pid > 0) {
+        // PARENT PROCESS: Instantly continue serving users.
+        rdb_child_pid = pid;
+        Logger::info("Auto-save RDB started in background (Child PID: " + std::to_string(pid) + ")");
+    } else {
+        rdb_save_in_progress.store(false);
+        Logger::error("Auto-save RDB failed to fork.");
+    }
+}
+
+void KeyValueStore::check_background_tasks() {
+    // 1. Check if the RDB Child finished
+    if (rdb_child_pid != -1) {
+        int stat;
+        if (waitpid(rdb_child_pid, &stat, WNOHANG) == rdb_child_pid) {
+            rdb_child_pid = -1;
+            rdb_save_in_progress.store(false);
+            last_save_time.store(get_current_time_ms() / 1000);
+            std::string tmp = Config::rdb_file + ".bgsave.tmp";
+            std::rename(tmp.c_str(), Config::rdb_file.c_str());
+            Logger::info("BGSAVE complete (Forked child finished).");
+        }
     }
     
-    rdb_save_in_progress.store(true);
-    std::thread([this, snapshot = std::move(snapshot)]() {
-        std::string tmp = Config::rdb_file + ".tmp";
-        if (rdb_save_snapshot(tmp, snapshot)) {
-            std::unique_lock<std::shared_mutex> lk(mtx);
-            std::rename(tmp.c_str(), Config::rdb_file.c_str());
-            last_save_time.store(get_current_time_ms() / 1000);
-            Logger::info("Auto-save RDB complete.");
-        } else {
-            Logger::error("Auto-save RDB failed.");
+    // 2. Check if the AOF Child finished
+    if (aof_child_pid != -1) {
+        int stat;
+        if (waitpid(aof_child_pid, &stat, WNOHANG) == aof_child_pid) {
+            std::string tmp = Config::aof_file + ".rewrite.tmp";
+            {
+                // Lock the parent briefly just to stitch the files together
+                std::unique_lock<std::shared_mutex> lk(mtx);
+                std::ofstream f(tmp, std::ios::app | std::ios::out);
+                
+                // Flush all the commands that came in while the child was running!
+                for (const auto& args : aof_rewrite_buffer) {
+                    f << "*" << args.size() << "\r\n";
+                    for (const auto& a : args) f << "$" << a.size() << "\r\n" << a << "\r\n";
+                }
+                f.flush(); f.close();
+                
+                // Swap the live file
+                if (aof_file.is_open()) aof_file.close();
+                std::rename(tmp.c_str(), Config::aof_file.c_str());
+                aof_file.open(Config::aof_file, std::ios::app | std::ios::out);
+                aof_rewrite_buffer.clear();
+            }
+            aof_child_pid = -1;
+            rewrite_in_progress.store(false);
+            Logger::info("BGREWRITEAOF complete and files swapped.");
         }
-        rdb_save_in_progress.store(false);
-    }).detach();
+    }
 }
