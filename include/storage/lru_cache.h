@@ -56,4 +56,11 @@ public:
 
     std::vector<CacheItem> get_all_items(int64_t current_time_ms) const;
     std::pair<size_t, std::vector<std::string>> scan(size_t cursor, size_t count, int64_t current_time_ms) const;
+
+    template <typename Func>
+void for_each(Func callback) const {
+    for (const auto& item : items) { 
+        callback(item);
+    }
+}
 };

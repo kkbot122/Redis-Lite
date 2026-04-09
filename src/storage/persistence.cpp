@@ -8,6 +8,7 @@
 #include <cstring>
 #include <unistd.h>    
 #include <sys/wait.h>
+#include <chrono>
 
 // ============================================================
 // RDB binary format
@@ -53,8 +54,12 @@ void KeyValueStore::append_to_aof(const std::vector<std::string>& args) {
         aof_file << "$" << a.size() << "\r\n" << a << "\r\n";
     aof_file.flush();
 
+    // FIXED: Buffer raw bytes to the string directly, avoiding massive heap fragmentation
     if (aof_child_pid != -1) {
-        aof_rewrite_buffer.push_back(args);
+        aof_rewrite_buffer += "*" + std::to_string(args.size()) + "\r\n";
+        for (const auto& a : args) {
+            aof_rewrite_buffer += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
+        }
     }
 }
 
@@ -133,15 +138,15 @@ std::string KeyValueStore::serialize_item_to_resp(const CacheItem& item) const {
 // ============================================================
 // RDB Persistence
 // ============================================================
-bool KeyValueStore::rdb_save_snapshot(const std::string& path,
-                                       const std::vector<CacheItem>& items) const {
+bool KeyValueStore::rdb_save_snapshot(const std::string& path, int64_t now) const {
     std::ofstream f(path, std::ios::binary | std::ios::trunc);
     if (!f.is_open()) return false;
 
     f.write(RDB_MAGIC, 9);
     w32(f, RDB_VERSION);
 
-    for (const auto& item : items) {
+    // FIXED: Iterate the cache directly without allocating memory
+    cache.for_each([&](const CacheItem& item) {
         if (std::holds_alternative<std::string>(item.value)) {
             w8(f, RDB_TYPE_STRING); w64(f, item.expires_at); wstr(f, item.key); wstr(f, std::get<std::string>(item.value));
         } else if (std::holds_alternative<std::list<std::string>>(item.value)) {
@@ -161,7 +166,8 @@ bool KeyValueStore::rdb_save_snapshot(const std::string& path,
             w8(f, RDB_TYPE_ZSET); w64(f, item.expires_at); wstr(f, item.key); w32(f, static_cast<uint32_t>(z.dict.size()));
             for (const auto& [member, score] : z.dict) { wstr(f, member); wdouble(f, score); }
         }
-    }
+    });
+    
     w8(f, RDB_EOF);
     f.flush();
     return f.good();
@@ -251,10 +257,9 @@ void KeyValueStore::maybe_auto_save() {
     pid_t pid = fork();
     if (pid == 0) {
         // CHILD PROCESS: We now have a perfectly frozen, zero-cost clone of RAM.
-        // We do NOT need to lock the mutex!
-        auto snap = cache.get_all_items(get_current_time_ms());
+        // We do NOT need to lock the mutex or copy data!
         std::string tmp = Config::rdb_file + ".bgsave.tmp";
-        rdb_save_snapshot(tmp, snap);
+        rdb_save_snapshot(tmp, get_current_time_ms());
         _exit(0); // Self-destruct silently
     } else if (pid > 0) {
         // PARENT PROCESS: Instantly continue serving users.
@@ -285,24 +290,30 @@ void KeyValueStore::check_background_tasks() {
         int stat;
         if (waitpid(aof_child_pid, &stat, WNOHANG) == aof_child_pid) {
             std::string tmp = Config::aof_file + ".rewrite.tmp";
+            std::string pending_commands;
+
+            // Phase 1: Lock the parent briefly just to extract the buffer and clear it
             {
-                // Lock the parent briefly just to stitch the files together
                 std::unique_lock<std::shared_mutex> lk(mtx);
-                std::ofstream f(tmp, std::ios::app | std::ios::out);
-                
-                // Flush all the commands that came in while the child was running!
-                for (const auto& args : aof_rewrite_buffer) {
-                    f << "*" << args.size() << "\r\n";
-                    for (const auto& a : args) f << "$" << a.size() << "\r\n" << a << "\r\n";
-                }
-                f.flush(); f.close();
-                
-                // Swap the live file
+                pending_commands = std::move(aof_rewrite_buffer);
+                aof_rewrite_buffer.clear(); 
+            }
+
+            // Phase 2: Perform SLOW Disk I/O completely outside the lock!
+            // The main thread can continue processing commands simultaneously.
+            std::ofstream f(tmp, std::ios::app | std::ios::out);
+            f.write(pending_commands.c_str(), pending_commands.size());
+            f.flush(); 
+            f.close();
+            
+            // Phase 3: Lock briefly again just to swap the file handles
+            {
+                std::unique_lock<std::shared_mutex> lk(mtx);
                 if (aof_file.is_open()) aof_file.close();
                 std::rename(tmp.c_str(), Config::aof_file.c_str());
                 aof_file.open(Config::aof_file, std::ios::app | std::ios::out);
-                aof_rewrite_buffer.clear();
             }
+
             aof_child_pid = -1;
             rewrite_in_progress.store(false);
             Logger::info("BGREWRITEAOF complete and files swapped.");

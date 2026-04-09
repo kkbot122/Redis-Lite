@@ -6,6 +6,7 @@
 #include <thread>
 #include <fnmatch.h>
 #include <unistd.h>
+#include <chrono>
 
 void KeyValueStore::init_commands() {
 
@@ -37,68 +38,68 @@ void KeyValueStore::init_commands() {
     // PERSISTENCE COMMANDS
     // ==========================================================
     command_registry["SAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
-        auto snap = cache.get_all_items(now);
-        if (rdb_save_snapshot(Config::rdb_file, snap)) {
+        // Just use the 'now' parameter directly!
+        if (rdb_save_snapshot(Config::rdb_file, now)) {
             last_save_time.store(now / 1000);
             return std::string("+OK\r\n");
         }
         return std::string("-ERR RDB save failed\r\n");
     };
 
-    command_registry["BGSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
-        if (rdb_save_in_progress.load() || rdb_child_pid != -1) return std::string("+Background save already in progress\r\n");
-        rdb_save_in_progress.store(true);
-        
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child
-            auto snap = cache.get_all_items(now);
-            std::string tmp = Config::rdb_file + ".bgsave.tmp";
-            rdb_save_snapshot(tmp, snap);
-            _exit(0); 
-            return std::string(""); // Dummy return to satisfy the compiler
-        } else if (pid > 0) {
-            // Parent
-            rdb_child_pid = pid;
-            return std::string("+Background saving started\r\n");
-        } else {
-            rdb_save_in_progress.store(false);
-            return std::string("-ERR fork failed\r\n");
-        }
-    };
+   command_registry["BGSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
+    if (rdb_save_in_progress.load() || rdb_child_pid != -1) return std::string("+Background save already in progress\r\n");
+    rdb_save_in_progress.store(true);
+    
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child Process: Do NOT copy the cache into a vector.
+        // Pass 'now' to rdb_save_snapshot so it iterates over the memory directly.
+        std::string tmp = Config::rdb_file + ".bgsave.tmp";
+        rdb_save_snapshot(tmp, now);
+        _exit(0); 
+        return std::string(""); 
+    } else if (pid > 0) {
+        rdb_child_pid = pid;
+        return std::string("+Background saving started\r\n");
+    } else {
+        rdb_save_in_progress.store(false);
+        return std::string("-ERR fork failed\r\n");
+    }
+};
 
     command_registry["LASTSAVE"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
         return ":" + std::to_string(last_save_time.load()) + "\r\n";
     };
 
     command_registry["BGREWRITEAOF"] = [this](const std::vector<std::string>& args, int64_t now, int resp_version) {
-        if (rewrite_in_progress.load() || aof_child_pid != -1) return std::string("+Background AOF rewrite already in progress\r\n");
-        rewrite_in_progress.store(true);
-        
-        // Clear the buffer so we can start catching new incoming commands
-        aof_rewrite_buffer.clear();
-        
-        pid_t pid = fork();
-        if (pid == 0) {
-            // Child
-            auto snap = cache.get_all_items(now);
-            std::string tmp = Config::aof_file + ".rewrite.tmp";
-            std::ofstream f(tmp, std::ios::trunc);
-            if (f.is_open()) {
-                for (const auto& item : snap) f << serialize_item_to_resp(item);
-                f.flush();
-            }
-            _exit(0);
-            return std::string(""); // Dummy return to satisfy the compiler
-        } else if (pid > 0) {
-            // Parent
-            aof_child_pid = pid;
-            return std::string("+Background append only file rewriting started\r\n");
-        } else {
-            rewrite_in_progress.store(false);
-            return std::string("-ERR fork failed\r\n");
+    if (rewrite_in_progress.load() || aof_child_pid != -1) return std::string("+Background AOF rewrite already in progress\r\n");
+    rewrite_in_progress.store(true);
+    
+    // Clear the string buffer 
+    aof_rewrite_buffer.clear();
+    
+    pid_t pid = fork();
+    if (pid == 0) {
+        // Child Process: Iterate over the cache directly, NO vectors.
+        std::string tmp = Config::aof_file + ".rewrite.tmp";
+        std::ofstream f(tmp, std::ios::trunc);
+        if (f.is_open()) {
+            // NOTE: You will need to add a for_each() method to your LRUCache (see Step 4)
+            cache.for_each([&](const CacheItem& item) {
+                f << serialize_item_to_resp(item);
+            });
+            f.flush();
         }
-    };
+        _exit(0);
+        return std::string(""); 
+    } else if (pid > 0) {
+        aof_child_pid = pid;
+        return std::string("+Background append only file rewriting started\r\n");
+    } else {
+        rewrite_in_progress.store(false);
+        return std::string("-ERR fork failed\r\n");
+    }
+};
 
     // ==========================================================
     // KEYSPACE COMMANDS

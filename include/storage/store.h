@@ -74,12 +74,12 @@ private:
     void        record_slowlog(const std::vector<std::string>& args, int64_t duration_ms);
 
     bool        rdb_save_snapshot(const std::string& path,
-                                  const std::vector<CacheItem>& items) const;
+                                  int64_t now) const;
     bool        rdb_load_snapshot(const std::string& path);
 
     pid_t rdb_child_pid = -1;
     pid_t aof_child_pid = -1;
-    std::vector<std::vector<std::string>> aof_rewrite_buffer;
+    std::string aof_rewrite_buffer;
 
 public:
     KeyValueStore();
