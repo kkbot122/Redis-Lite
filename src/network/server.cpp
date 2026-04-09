@@ -18,6 +18,7 @@
 #include <iomanip>
 #include <fstream>
 
+
 static std::atomic<bool> g_shutdown{false};
 static void signal_handler(int) { g_shutdown.store(true); }
 
@@ -96,11 +97,41 @@ void RedisServer::init_ssl() {
     Logger::info("TLS/SSL Engine Enabled. Encrypted connections online.");
 }
 
+// Replace your existing secure_send function with this robust version:
 void RedisServer::secure_send(int fd, const std::string& data) {
-    if (client_ssl.count(fd)) {
-        SSL_write(client_ssl[fd], data.c_str(), data.size());
-    } else {
-        send(fd, data.c_str(), data.size(), 0);
+    size_t total_sent = 0;
+    int retries = 0;
+    
+    while (total_sent < data.size()) {
+        ssize_t sent = 0;
+        
+        if (client_ssl.count(fd)) {
+            sent = SSL_write(client_ssl[fd], data.c_str() + total_sent, data.size() - total_sent);
+            if (sent <= 0) {
+                int err = SSL_get_error(client_ssl[fd], sent);
+                if (err == SSL_ERROR_WANT_WRITE || err == SSL_ERROR_WANT_READ) {
+                    if (retries++ > 50) break;
+                    std::this_thread::sleep_for(std::chrono::microseconds(500)); 
+                    continue;
+                }
+                break;
+            }
+        } else {
+            sent = send(fd, data.c_str() + total_sent, data.size() - total_sent, MSG_NOSIGNAL);
+            if (sent < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    if (retries++ > 50) break;
+                    std::this_thread::sleep_for(std::chrono::microseconds(500)); 
+                    continue;
+                }
+                break;
+            }
+        }
+        
+        if (sent > 0) {
+            total_sent += sent;
+            retries = 0;
+        }
     }
 }
 
@@ -316,7 +347,7 @@ void RedisServer::run() {
     if (bind(server_fd, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) < 0) {
         Logger::error("bind() failed"); return;
     }
-    listen(server_fd, 128); make_socket_non_blocking(server_fd);
+    listen(server_fd, SOMAXCONN); make_socket_non_blocking(server_fd);
 
     epoll_fd = epoll_create1(0);
     auto epoll_add = [&](int fd) {
