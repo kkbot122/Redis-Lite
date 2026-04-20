@@ -320,6 +320,7 @@ void RedisServer::close_client(int fd) {
     clients.erase(fd);
     replica_fds.erase(std::remove(replica_fds.begin(), replica_fds.end(), fd), replica_fds.end());
     epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    active_connections--;
     close(fd);
 }
 
@@ -386,6 +387,7 @@ void RedisServer::run() {
     }
 
     start_heartbeat_thread();
+    start_metrics_thread();
 
     struct epoll_event events[64];
     while (!g_shutdown.load()) {
@@ -438,6 +440,7 @@ void RedisServer::handle_new_connection(int listening_fd) {
 
     ClientState& s = clients[client_fd];
     s.read_buf = ""; s.authenticated = Config::requirepass.empty();
+    active_connections++;
 }
 
 void RedisServer::handle_client_data(int fd) {
@@ -557,6 +560,60 @@ void RedisServer::start_heartbeat_thread() {
                 close(sock);
             }
             std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }).detach();
+}
+
+void RedisServer::start_metrics_thread() {
+    std::thread([this]() {
+        // Run HTTP metrics on Port + 1000 (e.g., 8001 -> 9001)
+        int metrics_port = this->port + 1000;
+        
+        int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+        int opt = 1; setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = INADDR_ANY;
+        addr.sin_port = htons(metrics_port);
+
+        if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+            Logger::error("Failed to bind Metrics Port " + std::to_string(metrics_port));
+            return;
+        }
+        listen(server_fd, 10);
+        Logger::info("Prometheus Metrics HTTP endpoint listening on port " + std::to_string(metrics_port));
+
+        while (!g_shutdown.load()) {
+            int client_fd = accept(server_fd, nullptr, nullptr);
+            if (client_fd < 0) continue;
+
+            // Read and discard the incoming HTTP request (we assume it's a GET /metrics)
+            char buf[1024];
+            recv(client_fd, buf, sizeof(buf), 0); 
+
+            // Gather real-time internal engine stats
+            std::string metrics =
+                "# HELP redis_lite_memory_bytes Total memory allocated by the LRU cache\n"
+                "# TYPE redis_lite_memory_bytes gauge\n"
+                "redis_lite_memory_bytes " + std::to_string(store.get_memory_usage()) + "\n"
+                "# HELP redis_lite_commands_total Total number of commands processed\n"
+                "# TYPE redis_lite_commands_total counter\n"
+                "redis_lite_commands_total " + std::to_string(store.get_total_commands()) + "\n"
+                "# HELP redis_lite_connected_clients Active TCP client connections\n"
+                "# TYPE redis_lite_connected_clients gauge\n"
+                "redis_lite_connected_clients " + std::to_string(active_connections.load()) + "\n";
+
+            // Wrap it in a valid HTTP/1.1 Web Response
+            std::string http_resp =
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/plain; version=0.0.4\r\n"
+                "Content-Length: " + std::to_string(metrics.size()) + "\r\n"
+                "Connection: close\r\n\r\n" +
+                metrics;
+
+            // Send to browser/Prometheus and hang up
+            send(client_fd, http_resp.c_str(), http_resp.size(), 0);
+            close(client_fd);
         }
     }).detach();
 }

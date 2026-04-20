@@ -1,42 +1,40 @@
 # ==========================================
-# STAGE 1: THE BUILDER
+# STAGE 1: BUILDER
 # ==========================================
-# Start with a heavy, full Ubuntu image that has all the development tools
 FROM ubuntu:22.04 AS builder
 
-# Install the C++ compilers and CMake
 RUN apt-get update && apt-get install -y \
     build-essential \
-    cmake \
+    libssl-dev \
+    liblua5.3-dev \
+    pkg-config \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Set our working folder inside the container
-WORKDIR /app
+# Install latest CMake manually (no systemd issues)
+RUN curl -L https://github.com/Kitware/CMake/releases/download/v4.3.1/cmake-4.3.1-linux-x86_64.sh -o cmake.sh && \
+    chmod +x cmake.sh && \
+    ./cmake.sh --skip-license --prefix=/usr/local && \
+    rm cmake.sh
 
-# Copy our entire project from your Windows/WSL laptop into the Linux container
+WORKDIR /app
 COPY . .
 
-# Run our exact CMake build commands inside the container!
-RUN rm -rf build/* && \
+RUN rm -rf build && \
     cmake -S . -B build && \
     cmake --build build
 
 # ==========================================
-# STAGE 2: THE RUNNER (Production Image)
+# STAGE 2: RUNNER
 # ==========================================
-# Now, start over with a fresh, extremely lightweight Ubuntu image
 FROM ubuntu:22.04
 
 WORKDIR /app
 
-# Steal ONLY the finished executables and config file from the Builder stage.
-# We leave behind all the heavy compilers, .cpp files, and CMake garbage!
 COPY --from=builder /app/build/redis-server .
 COPY --from=builder /app/build/redis-router .
 COPY --from=builder /app/redis.conf .
 
-# Open port 6379 to the outside world
 EXPOSE 6379
 
-# When the container starts, run our server!
 CMD ["./redis-server"]

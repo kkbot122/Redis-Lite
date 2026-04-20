@@ -60,6 +60,8 @@ private:
     // Maps a client socket to the keys they are waiting for (for cleanup on disconnect)
     std::unordered_map<int, std::vector<std::string>> client_blocked_on;
 
+    std::atomic<int> active_connections{0}; // For Prometheus Metrics
+
     // Replication backlog for PSYNC partial resync.
     // Ring buffer: newest bytes at the front.
     static constexpr size_t BACKLOG_SIZE = 1024 * 1024;  // 1 MB
@@ -90,6 +92,8 @@ private:
 
     // Broadcast a write command to all replicas + update offset + backlog.
     void replicate(const std::vector<std::string>& args);
+
+    void start_metrics_thread();
 
 public:
     RedisServer(int p, int lp = 0);

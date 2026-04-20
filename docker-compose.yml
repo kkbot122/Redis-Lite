@@ -1,0 +1,39 @@
+services:
+  router:
+    build: .
+    ports:
+      - "6379:6379"
+    command: ["./redis-router"]
+    depends_on:
+      - node1
+      - node2
+      - node3
+
+  node1:
+    build: .
+    command: ["./redis-server", "8001"]
+
+  node2:
+    build: .
+    command: ["./redis-server", "8002"]
+
+  node3:
+    build: .
+    command: ["./redis-server", "8003"]
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SERVER_ROOT_URL=http://localhost:3000
+      - GF_SERVER_SERVE_FROM_SUB_PATH=false
+    depends_on:
+      - prometheus

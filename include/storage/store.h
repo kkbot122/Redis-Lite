@@ -92,4 +92,8 @@ public:
                                 TxState& tx, bool& authenticated, int resp_version=2);
     
     void        maybe_auto_save();
+
+    // --- Prometheus Metrics Getters ---
+    size_t  get_memory_usage() const { return cache.memory_usage(); }
+    int64_t get_total_commands() const { return total_commands.load(); }
 };
